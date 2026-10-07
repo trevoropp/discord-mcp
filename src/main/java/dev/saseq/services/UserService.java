@@ -33,19 +33,7 @@ public class UserService {
         return guildId;
     }
 
-    /**
-     * Public tool to retrieve a Discord user's ID by their username (optionally with discriminator) in a guild.
-     * @param username Username (optionally in the format username#discriminator)
-     * @param guildId Optional guild/server ID; uses default if not provided
-     * @return User ID string if found, or error message
-     */
-    @Tool(name = "get_user_id_by_name", description = "Get a Discord user's ID by username in a guild for ping usage <@id>.")
-    public String getUserIdByName(
-            @ToolParam(description = "Discord username (optionally username#discriminator)") String username,
-            @ToolParam(description = "Discord server ID", required = false) String guildId) {
-        if (username == null || username.isEmpty()) {
-            throw new IllegalArgumentException("username cannot be null");
-        }
+    private Guild requireGuild(String guildId) {
         guildId = resolveGuildId(guildId);
         if (guildId == null || guildId.isEmpty()) {
             throw new IllegalArgumentException("guildId cannot be null");
@@ -54,30 +42,114 @@ public class UserService {
         if (guild == null) {
             throw new IllegalArgumentException("Discord server not found by guildId");
         }
-        String name = username;
-        String discriminatorLocal = null;
-        if (username.contains("#")) {
-            int idx = username.lastIndexOf('#');
-            name = username.substring(0, idx);
-            discriminatorLocal = username.substring(idx + 1);
+        return guild;
+    }
+
+    /**
+     * Returns every member of the guild. Asks Discord for the full list; falls back to the local cache on failure.
+     */
+    private List<Member> loadAllMembers(Guild guild) {
+        try {
+            return guild.loadMembers().get();
+        } catch (Exception ex) {
+            return guild.getMembers();
         }
-        List<Member> members = guild.getMemberCache().getElementsByUsername(name, true);
-        if (discriminatorLocal != null) {
-            final String finalDiscriminator = discriminatorLocal;
-            members = members.stream()
-                    .filter(m -> m.getUser().getDiscriminator().equals(finalDiscriminator))
-                    .toList();
+    }
+
+    static String describeMember(Member m) {
+        User u = m.getUser();
+        String nickname = m.getNickname();
+        String globalName = u.getGlobalName();
+        return String.format("ID: %s | mention: <@%s> | username: %s | display name: %s | server nickname: %s%s",
+                u.getId(), u.getId(), u.getName(),
+                globalName != null ? globalName : "(none)",
+                nickname != null ? nickname : "(none)",
+                u.isBot() ? " | BOT" : "");
+    }
+
+    private static boolean nameMatches(Member m, String query, boolean exact) {
+        String q = query.toLowerCase();
+        for (String candidate : new String[]{m.getUser().getName(), m.getUser().getGlobalName(), m.getNickname()}) {
+            if (candidate == null) continue;
+            String c = candidate.toLowerCase();
+            if (exact ? c.equals(q) : c.contains(q)) return true;
         }
-        if (members.isEmpty()) {
-            throw new IllegalArgumentException("No user found with username " + username);
+        return false;
+    }
+
+    /**
+     * Finds members by username, display name or server nickname and returns their IDs and names.
+     */
+    @Tool(name = "get_user_id_by_name", description = "Find a Discord member by username, display name, or server nickname (case-insensitive; partial matches allowed). Returns user ID, username, display name and server nickname for each match. Ping a user with <@id>.")
+    public String getUserIdByName(
+            @ToolParam(description = "Username, display name, or server nickname (full or partial)") String username,
+            @ToolParam(description = "Discord server ID", required = false) String guildId) {
+        if (username == null || username.isBlank()) {
+            throw new IllegalArgumentException("username cannot be null");
         }
-        if (members.size() > 1) {
-            String userList = members.stream()
-                    .map(m -> m.getUser().getName() + "#" + m.getUser().getDiscriminator() + " (ID: " + m.getUser().getId() + ")")
-                    .collect(Collectors.joining(", "));
-            throw new IllegalArgumentException("Multiple users found with username '" + username + "'. List: " + userList + ". Please specify the full username#discriminator.");
+        Guild guild = requireGuild(guildId);
+        String query = username.trim();
+        if (query.startsWith("@")) {
+            query = query.substring(1);
         }
-        return members.get(0).getUser().getId();
+        int hash = query.lastIndexOf('#');
+        if (hash > 0 && query.substring(hash + 1).matches("\\d{1,4}")) {
+            query = query.substring(0, hash);
+        }
+        final String q = query;
+        List<Member> all = loadAllMembers(guild);
+        List<Member> matches = all.stream().filter(m -> nameMatches(m, q, true)).toList();
+        if (matches.isEmpty()) {
+            matches = all.stream().filter(m -> nameMatches(m, q, false)).toList();
+        }
+        if (matches.isEmpty()) {
+            throw new IllegalArgumentException("No member found matching '" + username + "' (checked username, display name and server nickname of " + all.size() + " members)");
+        }
+        int shown = Math.min(matches.size(), 25);
+        return "Found " + matches.size() + " member(s) matching '" + username + "'" + (matches.size() > shown ? " (showing first " + shown + ")" : "") + ":\n"
+                + matches.stream().limit(shown).map(m -> "- " + describeMember(m)).collect(Collectors.joining("\n"));
+    }
+
+    /**
+     * Lists all members of a guild with IDs, usernames, display names and nicknames.
+     */
+    @Tool(name = "list_members", description = "List all members of a server with user ID, username, display name and server nickname. Use it to build a name-to-ID roster. Paginated: 200 per page by default.")
+    public String listMembers(
+            @ToolParam(description = "Discord server ID", required = false) String guildId,
+            @ToolParam(description = "Page number starting at 1 (default 1)", required = false) String page,
+            @ToolParam(description = "Members per page, 1-500 (default 200)", required = false) String pageSize,
+            @ToolParam(description = "Include bot accounts: true or false (default false)", required = false) String includeBots) {
+        Guild guild = requireGuild(guildId);
+        int size = parseIntInRange(pageSize, 200, 1, 500, "pageSize");
+        int pageNumber = parseIntInRange(page, 1, 1, Integer.MAX_VALUE, "page");
+        boolean bots = "true".equalsIgnoreCase(includeBots);
+        List<Member> members = loadAllMembers(guild).stream()
+                .filter(m -> bots || !m.getUser().isBot())
+                .sorted(java.util.Comparator.comparing(m -> m.getEffectiveName().toLowerCase()))
+                .toList();
+        int totalPages = Math.max(1, (int) Math.ceil(members.size() / (double) size));
+        if (pageNumber > totalPages) {
+            throw new IllegalArgumentException("page " + pageNumber + " is past the last page (" + totalPages + ")");
+        }
+        int from = (pageNumber - 1) * size;
+        int to = Math.min(members.size(), from + size);
+        return "Server: " + guild.getName() + " | " + members.size() + " members | page " + pageNumber + " of " + totalPages + "\n"
+                + members.subList(from, to).stream().map(m -> "- " + describeMember(m)).collect(Collectors.joining("\n"));
+    }
+
+    private int parseIntInRange(String value, int defaultValue, int min, int max, String name) {
+        if (value == null || value.isBlank()) {
+            return defaultValue;
+        }
+        try {
+            int parsed = Integer.parseInt(value.trim());
+            if (parsed < min || parsed > max) {
+                throw new IllegalArgumentException(name + " is out of range");
+            }
+            return parsed;
+        } catch (NumberFormatException ex) {
+            throw new IllegalArgumentException(name + " must be a whole number");
+        }
     }
 
     /**
@@ -180,7 +252,7 @@ public class UserService {
      */
     @Tool(name = "read_private_messages", description = "Read private message history from a specific user, optionally paginated with before/after/around")
     public String readPrivateMessages(@ToolParam(description = "Discord user ID") String userId,
-                                      @ToolParam(description = "Number of messages to retrieve (1-100)", required = false) String count,
+                                      @ToolParam(description = "Number of messages to retrieve, 1-100 (default 25)", required = false) String count,
                                       @ToolParam(description = "Message ID to fetch messages before this message", required = false) String before,
                                       @ToolParam(description = "Message ID to fetch messages after this message", required = false) String after,
                                       @ToolParam(description = "Message ID to fetch messages around this message", required = false) String around) {
@@ -211,7 +283,7 @@ public class UserService {
 
     private int parseMessageLimit(String count) {
         if (count == null || count.isBlank()) {
-            return 100;
+            return 25;
         }
 
         int limit;
@@ -264,11 +336,11 @@ public class UserService {
                 .map(m -> {
                     String authorName = m.getAuthor().getName();
                     String timestamp = m.getTimeCreated().toString();
-                    String content = m.getContentDisplay();
+                    String content = m.getContentRaw();
                     String msgId = m.getId();
 
                     StringBuilder sb = new StringBuilder();
-                    sb.append(String.format("- (ID: %s) **[%s]** `%s`: ```%s```", msgId, authorName, timestamp, content));
+                    sb.append(String.format("- (ID: %s) **[%s | user ID: %s]** `%s`: ```%s```", msgId, authorName, m.getAuthor().getId(), timestamp, content));
 
                     List<Message.Attachment> attachments = m.getAttachments();
                     if (!attachments.isEmpty()) {

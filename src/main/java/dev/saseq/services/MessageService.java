@@ -1,17 +1,28 @@
 package dev.saseq.services;
 
 import net.dv8tion.jda.api.JDA;
+import net.dv8tion.jda.api.entities.Guild;
+import net.dv8tion.jda.api.entities.Member;
 import net.dv8tion.jda.api.entities.Message;
+import net.dv8tion.jda.api.entities.Role;
+import net.dv8tion.jda.api.entities.User;
 import net.dv8tion.jda.api.entities.channel.concrete.NewsChannel;
 import net.dv8tion.jda.api.entities.channel.concrete.TextChannel;
 import net.dv8tion.jda.api.entities.channel.concrete.ThreadChannel;
 import net.dv8tion.jda.api.entities.channel.middleman.MessageChannel;
 import net.dv8tion.jda.api.entities.emoji.Emoji;
+import net.dv8tion.jda.api.utils.TimeUtil;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
 import java.util.List;
 
 @Service
@@ -143,17 +154,28 @@ public class MessageService {
      * @param around    Optional message ID to fetch messages around this message.
      * @return A formatted string containing the retrieved messages.
      */
-    @Tool(name = "read_messages", description = "Read message history from a specific channel, optionally paginated with before/after/around")
+    @Tool(name = "read_messages", description = "Read message history from a specific channel. Each message shows the author's user ID, username, display name and server nickname; mentions stay in raw <@id> form with a legend of who they are. Use count to limit how many messages come back, and before/after/around (message IDs) or since/until (dates) to narrow the range.")
     public String readMessages(@ToolParam(description = "Discord channel ID") String channelId,
-                               @ToolParam(description = "Number of messages to retrieve (1-100)", required = false) String count,
+                               @ToolParam(description = "Number of messages to retrieve, 1-100 (default 25)", required = false) String count,
                                @ToolParam(description = "Message ID to fetch messages before this message", required = false) String before,
                                @ToolParam(description = "Message ID to fetch messages after this message", required = false) String after,
-                               @ToolParam(description = "Message ID to fetch messages around this message", required = false) String around) {
+                               @ToolParam(description = "Message ID to fetch messages around this message", required = false) String around,
+                               @ToolParam(description = "Same as count; accepted for convenience", required = false) String limit,
+                               @ToolParam(description = "Only messages sent at or after this time. ISO date or date-time, e.g. 2026-10-07 or 2026-10-07T08:00:00-10:00 (a bare date means 00:00 UTC). Returns the oldest matching messages first.", required = false) String since,
+                               @ToolParam(description = "Only messages sent before this time. Same format as since.", required = false) String until) {
         if (channelId == null || channelId.isEmpty()) {
             throw new IllegalArgumentException("channelId cannot be null");
         }
-        int limit = parseMessageLimit(count);
+        int max = parseMessageLimit(isProvided(count) ? count : limit);
         validateCursorParameters(before, after, around);
+        Instant sinceTime = parseTime(since, "since");
+        Instant untilTime = parseTime(until, "until");
+        if ((sinceTime != null || untilTime != null) && (isProvided(before) || isProvided(after) || isProvided(around))) {
+            throw new IllegalArgumentException("since/until cannot be combined with before/after/around");
+        }
+        if (sinceTime != null && untilTime != null && !sinceTime.isBefore(untilTime)) {
+            throw new IllegalArgumentException("since must be earlier than until");
+        }
 
         MessageChannel channel = getMessageChannelById(channelId);
         if (channel == null) {
@@ -161,26 +183,59 @@ public class MessageService {
         }
         List<Message> messages;
         if (isProvided(before)) {
-            messages = channel.getHistoryBefore(before, limit).complete().getRetrievedHistory();
+            messages = channel.getHistoryBefore(before, max).complete().getRetrievedHistory();
         } else if (isProvided(after)) {
-            messages = channel.getHistoryAfter(after, limit).complete().getRetrievedHistory();
+            messages = channel.getHistoryAfter(after, max).complete().getRetrievedHistory();
         } else if (isProvided(around)) {
-            messages = channel.getHistoryAround(around, limit).complete().getRetrievedHistory();
+            messages = channel.getHistoryAround(around, max).complete().getRetrievedHistory();
+        } else if (sinceTime != null) {
+            String cursor = Long.toUnsignedString(TimeUtil.getDiscordTimestamp(sinceTime.toEpochMilli()));
+            messages = new ArrayList<>(channel.getHistoryAfter(cursor, max).complete().getRetrievedHistory());
+            if (untilTime != null) {
+                messages.removeIf(m -> !m.getTimeCreated().toInstant().isBefore(untilTime));
+            }
+        } else if (untilTime != null) {
+            String cursor = Long.toUnsignedString(TimeUtil.getDiscordTimestamp(untilTime.toEpochMilli()));
+            messages = channel.getHistoryBefore(cursor, max).complete().getRetrievedHistory();
         } else {
-            messages = channel.getHistory().retrievePast(limit).complete();
+            messages = channel.getHistory().retrievePast(max).complete();
         }
         List<String> formatedMessages = formatMessages(messages);
         return "**Retrieved " + messages.size() + " messages:** \n" + String.join("\n", formatedMessages);
     }
 
+    private Instant parseTime(String value, String name) {
+        if (!isProvided(value)) {
+            return null;
+        }
+        String v = value.trim();
+        try {
+            return OffsetDateTime.parse(v).toInstant();
+        } catch (DateTimeParseException ignored) {
+        }
+        try {
+            return Instant.parse(v);
+        } catch (DateTimeParseException ignored) {
+        }
+        try {
+            return java.time.LocalDateTime.parse(v).toInstant(ZoneOffset.UTC);
+        } catch (DateTimeParseException ignored) {
+        }
+        try {
+            return LocalDate.parse(v).atStartOfDay().toInstant(ZoneOffset.UTC);
+        } catch (DateTimeParseException ex) {
+            throw new IllegalArgumentException(name + " must be an ISO date or date-time, e.g. 2026-10-07 or 2026-10-07T08:00:00-10:00");
+        }
+    }
+
     private int parseMessageLimit(String count) {
         if (count == null || count.isBlank()) {
-            return 100;
+            return 25;
         }
 
         int limit;
         try {
-            limit = Integer.parseInt(count);
+            limit = Integer.parseInt(count.trim());
         } catch (NumberFormatException ex) {
             throw new IllegalArgumentException("count must be an integer between 1 and 100");
         }
@@ -356,13 +411,29 @@ public class MessageService {
     private List<String> formatMessages(List<Message> messages) {
         return messages.stream()
                 .map(m -> {
-                    String authorName = m.getAuthor().getName();
+                    User author = m.getAuthor();
+                    Guild guild = m.isFromGuild() ? m.getGuild() : null;
                     String timestamp = m.getTimeCreated().toString();
-                    String content = m.getContentDisplay();
+                    String content = m.getContentRaw();
                     String msgId = m.getId();
 
                     StringBuilder sb = new StringBuilder();
-                    sb.append(String.format("- (ID: %s) **[%s]** `%s`: ```%s```", msgId, authorName, timestamp, content));
+                    sb.append(String.format("- (ID: %s) **[%s]** `%s`: ```%s```", msgId, describeUser(author, guild), timestamp, content));
+
+                    List<String> mentions = new ArrayList<>();
+                    for (User u : m.getMentions().getUsers()) {
+                        mentions.add("<@" + u.getId() + "> = " + describeUser(u, guild));
+                    }
+                    for (Role r : m.getMentions().getRoles()) {
+                        mentions.add("<@&" + r.getId() + "> = role " + r.getName());
+                    }
+                    m.getMentions().getChannels().forEach(c -> mentions.add("<#" + c.getId() + "> = channel " + c.getName()));
+                    if (m.getMentions().mentionsEveryone()) {
+                        mentions.add("@everyone/@here");
+                    }
+                    if (!mentions.isEmpty()) {
+                        sb.append("\n  Mentions: ").append(String.join("; ", mentions));
+                    }
 
                     List<Message.Attachment> attachments = m.getAttachments();
                     if (!attachments.isEmpty()) {
@@ -374,6 +445,25 @@ public class MessageService {
 
                     return sb.toString();
                 }).toList();
+    }
+
+    /**
+     * "username | user ID: 123 | display name: X | nickname: Y" for a message author or mentioned user.
+     */
+    private String describeUser(User user, Guild guild) {
+        StringBuilder sb = new StringBuilder(user.getName());
+        sb.append(" | user ID: ").append(user.getId());
+        if (user.getGlobalName() != null) {
+            sb.append(" | display name: ").append(user.getGlobalName());
+        }
+        Member member = guild != null ? guild.getMemberById(user.getId()) : null;
+        if (member != null && member.getNickname() != null) {
+            sb.append(" | nickname: ").append(member.getNickname());
+        }
+        if (user.isBot()) {
+            sb.append(" | BOT");
+        }
+        return sb.toString();
     }
 
     private String formatFileSize(int bytes) {
