@@ -5,13 +5,14 @@ import net.dv8tion.jda.api.entities.Guild;
 import net.dv8tion.jda.api.entities.Member;
 import net.dv8tion.jda.api.entities.Message;
 import net.dv8tion.jda.api.entities.User;
+import net.dv8tion.jda.api.exceptions.ErrorResponseException;
+import net.dv8tion.jda.api.requests.ErrorResponse;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
-import java.util.Objects;
 import java.util.stream.Collectors;
 
 @Service
@@ -322,13 +323,20 @@ public class UserService {
         return value != null && !value.isBlank();
     }
 
+    /**
+     * Looks a user up globally by ID, so a DM works no matter which of the bot's servers the user is in.
+     * Previously this fetched the user as a member of each server in turn, and Discord's
+     * "10007: Unknown Member" error from the first server they were not in aborted the lookup.
+     */
     private User getUserById(String userId) {
-        return jda.getGuilds().stream()
-                .map(guild -> guild.retrieveMemberById(userId).complete())
-                .filter(Objects::nonNull)
-                .map(Member::getUser)
-                .findFirst()
-                .orElse(null);
+        try {
+            return jda.retrieveUserById(userId).complete();
+        } catch (ErrorResponseException ex) {
+            if (ex.getErrorResponse() == ErrorResponse.UNKNOWN_USER) {
+                return null;
+            }
+            throw ex;
+        }
     }
 
     private List<String> formatMessages(List<Message> messages) {
