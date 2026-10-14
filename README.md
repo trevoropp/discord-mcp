@@ -326,8 +326,9 @@ Remote MCP Connector:
 
 > [!NOTE]
 > Discord does not let a bot list or poll its DMs, so the inbox is filled by a live listener and kept in memory (cleared on restart, max 500 messages).
-> To be notified of DMs immediately, set `DM_WEBHOOK_URL`: each incoming DM is POSTed there as JSON (`type`, `messageId`, `userId`, `username`, `displayName`, `receivedAt`, `content`, `attachments`).
-> Set `DM_WEBHOOK_SECRET` to have it sent as an `X-Webhook-Secret` header so the receiver can verify the source.
+> To be notified of messages immediately instead of polling, set `WEBHOOK_URL`. The bot POSTs JSON there for every DM (`"type":"dm_received"`), every server message that mentions the bot, and every message in a channel listed in `WEBHOOK_CHANNEL_IDS` (comma-separated channel IDs); the last two are `"type":"channel_message"`.
+> Fields: `type`, `guildId`, `channelId`, `channelName` (null for DMs), `messageId`, `userId`, `username`, `displayName`, `receivedAt`, `content`, `attachments`.
+> Set `WEBHOOK_SECRET` to send a shared secret on every request, in the header named by `WEBHOOK_SECRET_HEADER` (default `X-Webhook-Secret`).
 
 #### Message Management
 - [`send_message`](): Send a message to a specific channel

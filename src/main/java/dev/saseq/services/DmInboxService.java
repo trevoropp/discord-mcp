@@ -20,9 +20,11 @@ import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.Deque;
 import java.util.List;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 /**
@@ -33,9 +35,14 @@ import java.util.stream.Collectors;
  * up front. A DM from someone the agent had not already messaged was invisible to it.
  *
  * This service listens for every DM the bot receives, stores it in memory, and exposes it through
- * {@code check_dm_inbox}. Optionally it also forwards each DM to an HTTP endpoint (set
- * {@code DM_WEBHOOK_URL}, and {@code DM_WEBHOOK_SECRET} for an {@code X-Webhook-Secret} header)
- * so an agent can be notified the moment a DM arrives instead of polling.
+ * {@code check_dm_inbox}.
+ *
+ * Optionally it also forwards messages to an HTTP endpoint the moment they arrive, so an agent can
+ * be triggered instead of polling. Set {@code WEBHOOK_URL} to turn this on. What gets forwarded:
+ * every DM ({@code "type":"dm_received"}), every server message that mentions the bot, and every
+ * message in a channel listed in {@code WEBHOOK_CHANNEL_IDS} (comma-separated channel IDs); the
+ * last two are sent as {@code "type":"channel_message"}. {@code WEBHOOK_SECRET} is sent on each
+ * request in the header named by {@code WEBHOOK_SECRET_HEADER} (default {@code X-Webhook-Secret}).
  *
  * The inbox lives in memory only: it is empty after a restart, and holds at most
  * {@link #MAX_INBOX_SIZE} messages (oldest dropped first).
@@ -51,14 +58,31 @@ public class DmInboxService extends ListenerAdapter {
             .connectTimeout(Duration.ofSeconds(10))
             .build();
 
-    @Value("${DM_WEBHOOK_URL:}")
-    private String webhookUrl;
+    private final String webhookUrl;
+    private final String webhookSecret;
+    private final String webhookSecretHeader;
+    private final Set<String> forwardedChannelIds;
 
-    @Value("${DM_WEBHOOK_SECRET:}")
-    private String webhookSecret;
-
-    public DmInboxService(JDA jda) {
+    public DmInboxService(JDA jda,
+                          @Value("${WEBHOOK_URL:}") String webhookUrl,
+                          @Value("${WEBHOOK_SECRET:}") String webhookSecret,
+                          @Value("${WEBHOOK_SECRET_HEADER:X-Webhook-Secret}") String webhookSecretHeader,
+                          @Value("${WEBHOOK_CHANNEL_IDS:}") String webhookChannelIds) {
         this.jda = jda;
+        this.webhookUrl = webhookUrl == null ? "" : webhookUrl.trim();
+        this.webhookSecret = webhookSecret == null ? "" : webhookSecret.trim();
+        this.webhookSecretHeader = (webhookSecretHeader == null || webhookSecretHeader.isBlank())
+                ? "X-Webhook-Secret" : webhookSecretHeader.trim();
+        this.forwardedChannelIds = (webhookChannelIds == null || webhookChannelIds.isBlank())
+                ? Set.of()
+                : Arrays.stream(webhookChannelIds.split(","))
+                        .map(String::trim)
+                        .filter(s -> !s.isEmpty())
+                        .collect(Collectors.toUnmodifiableSet());
+        if (!this.webhookUrl.isEmpty()) {
+            System.out.println("Message webhook enabled: forwarding DMs, mentions of the bot, and "
+                    + forwardedChannelIds.size() + " watched channel(s)");
+        }
         jda.addEventListener(this);
     }
 
@@ -77,9 +101,6 @@ public class DmInboxService extends ListenerAdapter {
 
     @Override
     public void onMessageReceived(MessageReceivedEvent event) {
-        if (event.getChannelType() != ChannelType.PRIVATE) {
-            return;
-        }
         User author = event.getAuthor();
         if (author.isBot() || author.getIdLong() == jda.getSelfUser().getIdLong()) {
             return;
@@ -95,13 +116,27 @@ public class DmInboxService extends ListenerAdapter {
                 message.getAttachments().stream().map(Message.Attachment::getUrl).toList(),
                 true
         );
-        synchronized (inbox) {
-            inbox.addLast(entry);
-            while (inbox.size() > MAX_INBOX_SIZE) {
-                inbox.removeFirst();
+
+        if (event.getChannelType() == ChannelType.PRIVATE) {
+            synchronized (inbox) {
+                inbox.addLast(entry);
+                while (inbox.size() > MAX_INBOX_SIZE) {
+                    inbox.removeFirst();
+                }
             }
+            forwardToWebhook("dm_received", entry, null, null, null);
+            return;
         }
-        forwardToWebhook(entry);
+
+        if (!event.isFromGuild()) {
+            return;
+        }
+        boolean watchedChannel = forwardedChannelIds.contains(event.getChannel().getId());
+        boolean mentionsBot = message.getMentions().isMentioned(jda.getSelfUser(), Message.MentionType.USER);
+        if (watchedChannel || mentionsBot) {
+            forwardToWebhook("channel_message", entry,
+                    event.getGuild().getId(), event.getChannel().getId(), event.getChannel().getName());
+        }
     }
 
     /**
@@ -174,12 +209,15 @@ public class DmInboxService extends ListenerAdapter {
         return sb.toString();
     }
 
-    private void forwardToWebhook(InboxEntry e) {
-        if (webhookUrl == null || webhookUrl.isBlank()) {
+    private void forwardToWebhook(String type, InboxEntry e, String guildId, String channelId, String channelName) {
+        if (webhookUrl.isEmpty()) {
             return;
         }
         String json = "{"
-                + "\"type\":\"dm_received\","
+                + "\"type\":\"" + type + "\","
+                + "\"guildId\":" + jsonOrNull(guildId) + ","
+                + "\"channelId\":" + jsonOrNull(channelId) + ","
+                + "\"channelName\":" + jsonOrNull(channelName) + ","
                 + "\"messageId\":\"" + escape(e.messageId()) + "\","
                 + "\"userId\":\"" + escape(e.userId()) + "\","
                 + "\"username\":\"" + escape(e.username()) + "\","
@@ -193,14 +231,25 @@ public class DmInboxService extends ListenerAdapter {
                 .timeout(Duration.ofSeconds(15))
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(json));
-        if (webhookSecret != null && !webhookSecret.isBlank()) {
-            request.header("X-Webhook-Secret", webhookSecret);
+        if (!webhookSecret.isEmpty()) {
+            request.header(webhookSecretHeader, webhookSecret);
         }
         httpClient.sendAsync(request.build(), HttpResponse.BodyHandlers.discarding())
+                .thenAccept(response -> {
+                    if (response.statusCode() >= 300) {
+                        System.err.println("Message webhook returned HTTP " + response.statusCode()
+                                + " for " + type + " " + e.messageId());
+                    }
+                })
                 .exceptionally(ex -> {
-                    System.err.println("DM webhook delivery failed: " + ex.getMessage());
+                    System.err.println("Message webhook delivery failed for " + type + " " + e.messageId()
+                            + ": " + ex.getMessage());
                     return null;
                 });
+    }
+
+    private static String jsonOrNull(String s) {
+        return s == null ? "null" : "\"" + escape(s) + "\"";
     }
 
     private static String escape(String s) {
