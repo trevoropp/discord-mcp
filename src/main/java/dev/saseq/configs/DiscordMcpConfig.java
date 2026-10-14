@@ -1,6 +1,7 @@
 package dev.saseq.configs;
 
 import dev.saseq.services.DiscordService;
+import dev.saseq.services.DmInboxService;
 import dev.saseq.services.MessageService;
 import dev.saseq.services.UserService;
 import dev.saseq.services.ChannelService;
@@ -43,10 +44,12 @@ public class DiscordMcpConfig {
                                              InviteService inviteService,
                                              ChannelPermissionService channelPermissionService,
                                              EmojiService emojiService,
-                                             ForumService forumService) {
+                                             ForumService forumService,
+                                             DmInboxService dmInboxService) {
         return MethodToolCallbackProvider.builder().toolObjects(
                 discordService,
                 messageService,
+                dmInboxService,
                 userService,
                 channelService,
                 categoryService,
