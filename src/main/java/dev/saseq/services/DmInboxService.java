@@ -16,11 +16,16 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.Comparator;
 import java.util.Deque;
 import java.util.List;
@@ -44,8 +49,10 @@ import java.util.stream.Collectors;
  * last two are sent as {@code "type":"channel_message"}. {@code WEBHOOK_SECRET} is sent on each
  * request in the header named by {@code WEBHOOK_SECRET_HEADER} (default {@code X-Webhook-Secret}).
  *
- * The inbox lives in memory only: it is empty after a restart, and holds at most
- * {@link #MAX_INBOX_SIZE} messages (oldest dropped first).
+ * The inbox holds at most {@link #MAX_INBOX_SIZE} messages (oldest dropped first). Set
+ * {@code INBOX_FILE} to a path on persistent storage (e.g. a mounted volume) and the inbox is
+ * written there on every change and reloaded on startup, so a restart or redeploy loses nothing.
+ * Without it the inbox is memory-only and empty after each restart.
  */
 @Service
 public class DmInboxService extends ListenerAdapter {
@@ -62,13 +69,17 @@ public class DmInboxService extends ListenerAdapter {
     private final String webhookSecret;
     private final String webhookSecretHeader;
     private final Set<String> forwardedChannelIds;
+    private final Path inboxFile;
 
     public DmInboxService(JDA jda,
                           @Value("${WEBHOOK_URL:}") String webhookUrl,
                           @Value("${WEBHOOK_SECRET:}") String webhookSecret,
                           @Value("${WEBHOOK_SECRET_HEADER:X-Webhook-Secret}") String webhookSecretHeader,
-                          @Value("${WEBHOOK_CHANNEL_IDS:}") String webhookChannelIds) {
+                          @Value("${WEBHOOK_CHANNEL_IDS:}") String webhookChannelIds,
+                          @Value("${INBOX_FILE:}") String inboxFilePath) {
         this.jda = jda;
+        this.inboxFile = (inboxFilePath == null || inboxFilePath.isBlank()) ? null : Path.of(inboxFilePath.trim());
+        loadInbox();
         this.webhookUrl = webhookUrl == null ? "" : webhookUrl.trim();
         this.webhookSecret = webhookSecret == null ? "" : webhookSecret.trim();
         this.webhookSecretHeader = (webhookSecretHeader == null || webhookSecretHeader.isBlank())
@@ -123,6 +134,7 @@ public class DmInboxService extends ListenerAdapter {
                 while (inbox.size() > MAX_INBOX_SIZE) {
                     inbox.removeFirst();
                 }
+                saveInbox();
             }
             forwardToWebhook("dm_received", entry, null, null, null);
             return;
@@ -164,6 +176,9 @@ public class DmInboxService extends ListenerAdapter {
             }
             inbox.clear();
             inbox.addAll(updated);
+            if (mark && !selected.isEmpty()) {
+                saveInbox();
+            }
         }
 
         if (selected.isEmpty()) {
@@ -246,6 +261,81 @@ public class DmInboxService extends ListenerAdapter {
                             + ": " + ex.getMessage());
                     return null;
                 });
+    }
+
+    // ---- persistence (one entry per line, fields tab-separated, free text base64-encoded) ----
+
+    private static final String FILE_HEADER = "# discord-mcp dm inbox v1";
+
+    /** Must be called with the inbox lock held. Failures are logged, never thrown: the inbox keeps working in memory. */
+    private void saveInbox() {
+        if (inboxFile == null) {
+            return;
+        }
+        try {
+            List<String> lines = new ArrayList<>(inbox.size() + 1);
+            lines.add(FILE_HEADER);
+            for (InboxEntry e : inbox) {
+                lines.add(String.join("\t",
+                        e.messageId(),
+                        e.userId(),
+                        b64(e.username()),
+                        b64(e.displayName()),
+                        e.receivedAt().toString(),
+                        e.unread() ? "1" : "0",
+                        b64(e.content()),
+                        e.attachmentUrls().stream().map(DmInboxService::b64).collect(Collectors.joining(","))));
+            }
+            Path parent = inboxFile.toAbsolutePath().getParent();
+            if (parent != null) {
+                Files.createDirectories(parent);
+            }
+            Path tmp = inboxFile.resolveSibling(inboxFile.getFileName() + ".tmp");
+            Files.write(tmp, lines, StandardCharsets.UTF_8);
+            Files.move(tmp, inboxFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (Exception ex) {
+            System.err.println("Could not save DM inbox to " + inboxFile + ": " + ex.getMessage());
+        }
+    }
+
+    private void loadInbox() {
+        if (inboxFile == null || !Files.exists(inboxFile)) {
+            return;
+        }
+        int loaded = 0;
+        try {
+            for (String line : Files.readAllLines(inboxFile, StandardCharsets.UTF_8)) {
+                if (line.isBlank() || line.startsWith("#")) {
+                    continue;
+                }
+                String[] f = line.split("\t", -1);
+                if (f.length < 8) {
+                    continue;
+                }
+                List<String> attachments = f[7].isEmpty()
+                        ? List.of()
+                        : Arrays.stream(f[7].split(",")).map(DmInboxService::unb64).toList();
+                synchronized (inbox) {
+                    inbox.addLast(new InboxEntry(f[0], f[1], unb64(f[2]), unb64(f[3]),
+                            OffsetDateTime.parse(f[4]), unb64(f[6]), attachments, "1".equals(f[5])));
+                    while (inbox.size() > MAX_INBOX_SIZE) {
+                        inbox.removeFirst();
+                    }
+                }
+                loaded++;
+            }
+            System.out.println("Loaded " + loaded + " DM(s) into the inbox from " + inboxFile);
+        } catch (Exception ex) {
+            System.err.println("Could not load DM inbox from " + inboxFile + ": " + ex.getMessage());
+        }
+    }
+
+    private static String b64(String s) {
+        return Base64.getEncoder().encodeToString((s == null ? "" : s).getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static String unb64(String s) {
+        return new String(Base64.getDecoder().decode(s), StandardCharsets.UTF_8);
     }
 
     private static String jsonOrNull(String s) {

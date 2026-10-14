@@ -325,7 +325,7 @@ Remote MCP Connector:
 - [`list_dm_conversations`](): List users the bot has an open DM conversation with
 
 > [!NOTE]
-> Discord does not let a bot list or poll its DMs, so the inbox is filled by a live listener and kept in memory (cleared on restart, max 500 messages).
+> Discord does not let a bot list or poll its DMs, so the inbox is filled by a live listener (max 500 messages). Set `INBOX_FILE` to a path on persistent storage (e.g. `/data/dm-inbox.txt` on a mounted volume) to keep it across restarts; without it the inbox is memory-only.
 > To be notified of messages immediately instead of polling, set `WEBHOOK_URL`. The bot POSTs JSON there for every DM (`"type":"dm_received"`), every server message that mentions the bot, and every message in a channel listed in `WEBHOOK_CHANNEL_IDS` (comma-separated channel IDs); the last two are `"type":"channel_message"`.
 > Fields: `type`, `guildId`, `channelId`, `channelName` (null for DMs), `messageId`, `userId`, `username`, `displayName`, `receivedAt`, `content`, `attachments`.
 > Set `WEBHOOK_SECRET` to send a shared secret on every request, in the header named by `WEBHOOK_SECRET_HEADER` (default `X-Webhook-Secret`).
@@ -334,6 +334,7 @@ Remote MCP Connector:
 - [`send_message`](): Send a message to a specific channel
 - [`edit_message`](): Edit a message from a specific channel
 - [`delete_message`](): Delete a message from a specific channel
+- [`get_updates_since`](): All new messages across channels since a time (`sinceMinutes` or `since`), grouped by server and channel; one call for a periodic sweep
 - [`read_messages`](): Read message history from a specific channel (includes attachment metadata, supports `count` 1-100 and optional cursor: `before` or `after` or `around`)
 - [`add_reaction`](): Add a reaction (emoji) to a specific message
 - [`remove_reaction`](): Remove a specified reaction (emoji) from a message
