@@ -321,6 +321,14 @@ Remote MCP Connector:
 - [`edit_private_message`](): Edit a private message from a specific user
 - [`delete_private_message`](): Delete a private message from a specific user
 - [`read_private_messages`](): Read private message history from a specific user (includes attachment metadata, supports `count` 1-100 and optional cursor: `before` or `after` or `around`)
+- [`check_dm_inbox`](): List DMs received by the bot since it started (unread only by default, marked read on return); optional `fromUserId` filter
+- [`list_dm_conversations`](): List users the bot has an open DM conversation with
+
+> [!NOTE]
+> Discord does not let a bot list or poll its DMs, so the inbox is filled by a live listener and kept in memory (cleared on restart, max 500 messages).
+> To be notified of messages immediately instead of polling, set `WEBHOOK_URL`. The bot POSTs JSON there for every DM (`"type":"dm_received"`), every server message that mentions the bot, and every message in a channel listed in `WEBHOOK_CHANNEL_IDS` (comma-separated channel IDs); the last two are `"type":"channel_message"`.
+> Fields: `type`, `guildId`, `channelId`, `channelName` (null for DMs), `messageId`, `userId`, `username`, `displayName`, `receivedAt`, `content`, `attachments`.
+> Set `WEBHOOK_SECRET` to send a shared secret on every request, in the header named by `WEBHOOK_SECRET_HEADER` (default `X-Webhook-Secret`).
 
 #### Message Management
 - [`send_message`](): Send a message to a specific channel
