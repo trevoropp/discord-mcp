@@ -1,6 +1,7 @@
 package dev.saseq.services;
 
 import net.dv8tion.jda.api.JDA;
+import net.dv8tion.jda.api.Permission;
 import net.dv8tion.jda.api.entities.Guild;
 import net.dv8tion.jda.api.entities.Member;
 import net.dv8tion.jda.api.entities.Message;
@@ -202,6 +203,101 @@ public class MessageService {
         }
         List<String> formatedMessages = formatMessages(messages);
         return "**Retrieved " + messages.size() + " messages:** \n" + String.join("\n", formatedMessages);
+    }
+
+    /**
+     * One call that returns everything new across many channels, so a periodic sweep is a single
+     * request instead of one read_messages call per channel.
+     */
+    @Tool(name = "get_updates_since", description = "Return all new messages across channels since a point in time, grouped by server and channel, oldest first. Use this for a periodic sweep instead of calling read_messages on each channel. Give either sinceMinutes (e.g. 30) or since (ISO date-time). By default covers every text channel the bot can read in every server; pass channelIds to narrow it. Messages from bots are skipped unless includeBots is true. A channel that hits limitPerChannel is marked truncated; use read_messages with after to page it.")
+    public String getUpdatesSince(@ToolParam(description = "Look back this many minutes (1-10080). Ignored if since is given.", required = false) String sinceMinutes,
+                                  @ToolParam(description = "Only messages sent at or after this time. ISO date-time, e.g. 2026-10-07T08:00:00-10:00", required = false) String since,
+                                  @ToolParam(description = "Comma-separated channel IDs to check. Omit to check every readable text channel in every server.", required = false) String channelIds,
+                                  @ToolParam(description = "Max messages per channel, 1-100 (default 50)", required = false) String limitPerChannel,
+                                  @ToolParam(description = "true = include messages posted by bots (default false)", required = false) String includeBots) {
+        Instant sinceTime = parseTime(since, "since");
+        if (sinceTime == null) {
+            int minutes = 30;
+            if (isProvided(sinceMinutes)) {
+                try {
+                    minutes = Integer.parseInt(sinceMinutes.trim());
+                } catch (NumberFormatException ex) {
+                    throw new IllegalArgumentException("sinceMinutes must be a whole number of minutes");
+                }
+                if (minutes < 1 || minutes > 10080) {
+                    throw new IllegalArgumentException("sinceMinutes must be between 1 and 10080 (7 days)");
+                }
+            }
+            sinceTime = Instant.now().minusSeconds(60L * minutes);
+        }
+        int perChannel = parseMessageLimit(isProvided(limitPerChannel) ? limitPerChannel : "50");
+        boolean bots = "true".equalsIgnoreCase(includeBots);
+        String cursor = Long.toUnsignedString(TimeUtil.getDiscordTimestamp(sinceTime.toEpochMilli()));
+
+        List<MessageChannel> channels = new ArrayList<>();
+        if (isProvided(channelIds)) {
+            for (String id : channelIds.split(",")) {
+                if (id.isBlank()) {
+                    continue;
+                }
+                MessageChannel c = getMessageChannelById(id.trim());
+                if (c == null) {
+                    throw new IllegalArgumentException("Channel not found by channelId: " + id.trim());
+                }
+                channels.add(c);
+            }
+        } else {
+            for (Guild guild : jda.getGuilds()) {
+                for (TextChannel c : guild.getTextChannels()) {
+                    if (guild.getSelfMember().hasPermission(c, Permission.VIEW_CHANNEL, Permission.MESSAGE_HISTORY)) {
+                        channels.add(c);
+                    }
+                }
+            }
+        }
+
+        StringBuilder out = new StringBuilder();
+        int total = 0;
+        int channelsWithNews = 0;
+        for (MessageChannel channel : channels) {
+            List<Message> messages;
+            try {
+                messages = new ArrayList<>(channel.getHistoryAfter(cursor, perChannel).complete().getRetrievedHistory());
+            } catch (Exception ex) {
+                out.append("\n### ").append(describeChannel(channel)).append("\n  (could not read: ").append(ex.getMessage()).append(")\n");
+                continue;
+            }
+            boolean truncated = messages.size() >= perChannel;
+            if (!bots) {
+                messages.removeIf(m -> m.getAuthor().isBot());
+            }
+            if (messages.isEmpty()) {
+                continue;
+            }
+            messages.sort((a, b) -> a.getTimeCreated().compareTo(b.getTimeCreated()));
+            channelsWithNews++;
+            total += messages.size();
+            out.append("\n### ").append(describeChannel(channel))
+                    .append(" (").append(messages.size()).append(truncated ? ", truncated" : "").append(")\n");
+            out.append(String.join("\n", formatMessages(messages))).append("\n");
+        }
+        if (total == 0) {
+            return "No new messages since " + sinceTime + " in " + channels.size() + " channel(s).";
+        }
+        return "**" + total + " new message(s) in " + channelsWithNews + " of " + channels.size()
+                + " channel(s) since " + sinceTime + ":**\n" + out;
+    }
+
+    private String describeChannel(MessageChannel channel) {
+        String guildName = "";
+        if (channel instanceof TextChannel tc) {
+            guildName = tc.getGuild().getName() + " / ";
+        } else if (channel instanceof ThreadChannel th) {
+            guildName = th.getGuild().getName() + " / ";
+        } else if (channel instanceof NewsChannel nc) {
+            guildName = nc.getGuild().getName() + " / ";
+        }
+        return guildName + "#" + channel.getName() + " (ID: " + channel.getId() + ")";
     }
 
     private Instant parseTime(String value, String name) {
