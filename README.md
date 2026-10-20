@@ -325,8 +325,8 @@ Remote MCP Connector:
 - [`list_dm_conversations`](): List users the bot has an open DM conversation with
 
 > [!NOTE]
-> Discord does not let a bot list or poll its DMs, so the inbox is filled by a live listener (max 500 messages). Set `INBOX_FILE` to a path on persistent storage (e.g. `/data/dm-inbox.txt` on a mounted volume) to keep it across restarts; without it the inbox is memory-only.
-> To be notified of messages immediately instead of polling, set `WEBHOOK_URL`. The bot POSTs JSON there for every DM (`"type":"dm_received"`), every server message that mentions the bot, and every message in a channel listed in `WEBHOOK_CHANNEL_IDS` (comma-separated channel IDs); the last two are `"type":"channel_message"`.
+> Discord does not let a bot list or poll its DMs, so the inbox is filled by a live listener (most recent 3000 messages, oldest dropped first). Set `INBOX_FILE` to a path on persistent storage (e.g. `/data/dm-inbox.txt` on a mounted volume) to keep it across restarts; without it the inbox is memory-only.
+> To be notified of messages immediately instead of polling, set `WEBHOOK_URL`. The bot POSTs JSON there for every DM (`"type":"dm_received"`), every server message that mentions the bot, and every message in a channel listed in `WEBHOOK_CHANNEL_IDS` (comma-separated channel IDs); the last two are `"type":"channel_message"`. Edits to any of those messages are sent as `"type":"message_edited"` with the new content. Network errors and 5xx responses are retried once after 5 seconds; 4xx responses are logged with the response body and not retried.
 > Fields: `type`, `guildId`, `channelId`, `channelName` (null for DMs), `messageId`, `userId`, `username`, `displayName`, `receivedAt`, `content`, `attachments`.
 > Set `WEBHOOK_SECRET` to send a shared secret on every request, in the header named by `WEBHOOK_SECRET_HEADER` (default `X-Webhook-Secret`).
 

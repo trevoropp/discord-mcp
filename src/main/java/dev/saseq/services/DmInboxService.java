@@ -6,6 +6,7 @@ import net.dv8tion.jda.api.entities.User;
 import net.dv8tion.jda.api.entities.channel.ChannelType;
 import net.dv8tion.jda.api.entities.channel.concrete.PrivateChannel;
 import net.dv8tion.jda.api.events.message.MessageReceivedEvent;
+import net.dv8tion.jda.api.events.message.MessageUpdateEvent;
 import net.dv8tion.jda.api.hooks.ListenerAdapter;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
@@ -30,6 +31,8 @@ import java.util.Comparator;
 import java.util.Deque;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 /**
@@ -46,8 +49,11 @@ import java.util.stream.Collectors;
  * be triggered instead of polling. Set {@code WEBHOOK_URL} to turn this on. What gets forwarded:
  * every DM ({@code "type":"dm_received"}), every server message that mentions the bot, and every
  * message in a channel listed in {@code WEBHOOK_CHANNEL_IDS} (comma-separated channel IDs); the
- * last two are sent as {@code "type":"channel_message"}. {@code WEBHOOK_SECRET} is sent on each
+ * last two are sent as {@code "type":"channel_message"}. Edits to any of those messages are sent
+ * as {@code "type":"message_edited"} with the new content. {@code WEBHOOK_SECRET} is sent on each
  * request in the header named by {@code WEBHOOK_SECRET_HEADER} (default {@code X-Webhook-Secret}).
+ * A delivery that fails with a network error or a 5xx is retried once after a short delay; a 4xx
+ * is not retried, but the response body is logged so the rejection can be diagnosed.
  *
  * The inbox holds at most {@link #MAX_INBOX_SIZE} messages (oldest dropped first). Set
  * {@code INBOX_FILE} to a path on persistent storage (e.g. a mounted volume) and the inbox is
@@ -57,7 +63,9 @@ import java.util.stream.Collectors;
 @Service
 public class DmInboxService extends ListenerAdapter {
 
-    private static final int MAX_INBOX_SIZE = 500;
+    /** About two weeks of DMs at a few hundred per day. */
+    private static final int MAX_INBOX_SIZE = 3000;
+    private static final Duration WEBHOOK_RETRY_DELAY = Duration.ofSeconds(5);
 
     private final JDA jda;
     private final Deque<InboxEntry> inbox = new ArrayDeque<>();
@@ -112,23 +120,14 @@ public class DmInboxService extends ListenerAdapter {
 
     @Override
     public void onMessageReceived(MessageReceivedEvent event) {
-        User author = event.getAuthor();
+        Message message = event.getMessage();
+        User author = message.getAuthor();
         if (author.isBot() || author.getIdLong() == jda.getSelfUser().getIdLong()) {
             return;
         }
-        Message message = event.getMessage();
-        InboxEntry entry = new InboxEntry(
-                message.getId(),
-                author.getId(),
-                author.getName(),
-                author.getGlobalName() != null ? author.getGlobalName() : author.getName(),
-                message.getTimeCreated(),
-                message.getContentRaw(),
-                message.getAttachments().stream().map(Message.Attachment::getUrl).toList(),
-                true
-        );
+        InboxEntry entry = toEntry(message);
 
-        if (event.getChannelType() == ChannelType.PRIVATE) {
+        if (message.getChannelType() == ChannelType.PRIVATE) {
             synchronized (inbox) {
                 inbox.addLast(entry);
                 while (inbox.size() > MAX_INBOX_SIZE) {
@@ -140,21 +139,86 @@ public class DmInboxService extends ListenerAdapter {
             return;
         }
 
-        if (!event.isFromGuild()) {
+        if (!message.isFromGuild()) {
             return;
         }
-        boolean watchedChannel = forwardedChannelIds.contains(event.getChannel().getId());
-        boolean mentionsBot = message.getMentions().isMentioned(jda.getSelfUser(), Message.MentionType.USER);
-        if (watchedChannel || mentionsBot) {
+        if (shouldForwardGuildMessage(message)) {
             forwardToWebhook("channel_message", entry,
-                    event.getGuild().getId(), event.getChannel().getId(), event.getChannel().getName());
+                    message.getGuild().getId(), message.getChannel().getId(), message.getChannel().getName());
         }
     }
 
     /**
-     * Lists DMs the bot has received since it started. By default returns only unread ones and marks them read.
+     * An edit to a message that would have been forwarded when it was sent is forwarded again as
+     * {@code message_edited}, carrying the new content, so the agent is not left acting on text the
+     * sender has since changed. Edited DMs also replace their original entry in the inbox.
      */
-    @Tool(name = "check_dm_inbox", description = "List direct messages sent to the bot. Returns unread DMs by default and marks them as read, so each call shows what is new since the last check. Use this to find out who has messaged the bot, then reply with send_private_message using the sender's user ID. The inbox is kept in memory since the bot last started.")
+    @Override
+    public void onMessageUpdate(MessageUpdateEvent event) {
+        Message message = event.getMessage();
+        User author = message.getAuthor();
+        if (author.isBot() || author.getIdLong() == jda.getSelfUser().getIdLong()) {
+            return;
+        }
+        InboxEntry edited = toEntry(message);
+
+        if (message.getChannelType() == ChannelType.PRIVATE) {
+            synchronized (inbox) {
+                List<InboxEntry> updated = new ArrayList<>(inbox.size());
+                boolean replaced = false;
+                for (InboxEntry e : inbox) {
+                    if (e.messageId().equals(edited.messageId())) {
+                        // keep the original received time and read state, swap in the new content
+                        updated.add(new InboxEntry(e.messageId(), e.userId(), e.username(), e.displayName(),
+                                e.receivedAt(), edited.content(), edited.attachmentUrls(), e.unread()));
+                        replaced = true;
+                    } else {
+                        updated.add(e);
+                    }
+                }
+                if (replaced) {
+                    inbox.clear();
+                    inbox.addAll(updated);
+                    saveInbox();
+                }
+            }
+            forwardToWebhook("message_edited", edited, null, null, null);
+            return;
+        }
+
+        if (!message.isFromGuild()) {
+            return;
+        }
+        if (shouldForwardGuildMessage(message)) {
+            forwardToWebhook("message_edited", edited,
+                    message.getGuild().getId(), message.getChannel().getId(), message.getChannel().getName());
+        }
+    }
+
+    private InboxEntry toEntry(Message message) {
+        User author = message.getAuthor();
+        return new InboxEntry(
+                message.getId(),
+                author.getId(),
+                author.getName(),
+                author.getGlobalName() != null ? author.getGlobalName() : author.getName(),
+                message.getTimeCreated(),
+                message.getContentRaw(),
+                message.getAttachments().stream().map(Message.Attachment::getUrl).toList(),
+                true
+        );
+    }
+
+    private boolean shouldForwardGuildMessage(Message message) {
+        boolean watchedChannel = forwardedChannelIds.contains(message.getChannel().getId());
+        boolean mentionsBot = message.getMentions().isMentioned(jda.getSelfUser(), Message.MentionType.USER);
+        return watchedChannel || mentionsBot;
+    }
+
+    /**
+     * Lists DMs the bot has received. By default returns only unread ones and marks them read.
+     */
+    @Tool(name = "check_dm_inbox", description = "List direct messages sent to the bot. Returns unread DMs by default and marks them as read, so each call shows what is new since the last check. Use this to find out who has messaged the bot, then reply with send_private_message using the sender's user ID. The inbox is saved to disk and survives bot restarts and redeploys; it keeps the most recent " + MAX_INBOX_SIZE + " DMs (roughly two weeks), oldest dropped first.")
     public String checkDmInbox(@ToolParam(description = "true (default) = only DMs not yet returned by a previous call; false = every DM kept in the inbox", required = false) String unreadOnly,
                                @ToolParam(description = "true (default) = mark the returned DMs as read; false = leave them unread so the next call returns them again", required = false) String markAsRead,
                                @ToolParam(description = "Only return DMs from this user ID", required = false) String fromUserId) {
@@ -249,18 +313,51 @@ public class DmInboxService extends ListenerAdapter {
         if (!webhookSecret.isEmpty()) {
             request.header(webhookSecretHeader, webhookSecret);
         }
-        httpClient.sendAsync(request.build(), HttpResponse.BodyHandlers.discarding())
+        sendWebhook(request.build(), type + " " + e.messageId(), 1);
+    }
+
+    /**
+     * Sends one webhook request. A network failure or a 5xx is retried once after
+     * {@link #WEBHOOK_RETRY_DELAY}; a 4xx means the receiver rejected the payload, so it is
+     * logged with the response body and not retried.
+     */
+    private void sendWebhook(HttpRequest request, String label, int attempt) {
+        httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
                 .thenAccept(response -> {
-                    if (response.statusCode() >= 300) {
-                        System.err.println("Message webhook returned HTTP " + response.statusCode()
-                                + " for " + type + " " + e.messageId());
+                    int status = response.statusCode();
+                    if (status < 300) {
+                        return;
                     }
+                    if (status >= 500 && attempt == 1) {
+                        System.err.println("Message webhook returned HTTP " + status + " for " + label
+                                + "; retrying once");
+                        retryWebhook(request, label);
+                        return;
+                    }
+                    String body = response.body() == null ? "" : response.body().strip();
+                    if (body.length() > 500) {
+                        body = body.substring(0, 500) + "...";
+                    }
+                    System.err.println("Message webhook returned HTTP " + status + " for " + label
+                            + (attempt > 1 ? " (after retry)" : "")
+                            + (body.isEmpty() ? "" : ": " + body));
                 })
                 .exceptionally(ex -> {
-                    System.err.println("Message webhook delivery failed for " + type + " " + e.messageId()
-                            + ": " + ex.getMessage());
+                    if (attempt == 1) {
+                        System.err.println("Message webhook delivery failed for " + label + ": "
+                                + ex.getMessage() + "; retrying once");
+                        retryWebhook(request, label);
+                    } else {
+                        System.err.println("Message webhook delivery failed for " + label
+                                + " after retry: " + ex.getMessage());
+                    }
                     return null;
                 });
+    }
+
+    private void retryWebhook(HttpRequest request, String label) {
+        CompletableFuture.delayedExecutor(WEBHOOK_RETRY_DELAY.toMillis(), TimeUnit.MILLISECONDS)
+                .execute(() -> sendWebhook(request, label, 2));
     }
 
     // ---- persistence (one entry per line, fields tab-separated, free text base64-encoded) ----
