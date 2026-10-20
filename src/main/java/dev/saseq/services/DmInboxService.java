@@ -1,6 +1,7 @@
 package dev.saseq.services;
 
 import net.dv8tion.jda.api.JDA;
+import net.dv8tion.jda.api.entities.Guild;
 import net.dv8tion.jda.api.entities.Message;
 import net.dv8tion.jda.api.entities.User;
 import net.dv8tion.jda.api.entities.channel.ChannelType;
@@ -12,6 +13,7 @@ import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.beans.factory.DisposableBean;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.env.Environment;
 import org.springframework.stereotype.Service;
 
 import java.net.URI;
@@ -31,6 +33,7 @@ import java.util.Base64;
 import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -51,12 +54,17 @@ import java.util.stream.Collectors;
  * {@code check_dm_inbox}.
  *
  * Optionally it also forwards messages to an HTTP endpoint the moment they arrive, so an agent can
- * be triggered instead of polling. Set {@code WEBHOOK_URL} to turn this on. What gets forwarded:
- * every DM ({@code "type":"dm_received"}), every server message that mentions the bot, and every
- * message in a channel listed in {@code WEBHOOK_CHANNEL_IDS} (comma-separated channel IDs); the
- * last two are sent as {@code "type":"channel_message"}. Edits to any of those messages are sent
- * as {@code "type":"message_edited"} with the new content. {@code WEBHOOK_SECRET} is sent on each
- * request in the header named by {@code WEBHOOK_SECRET_HEADER} (default {@code X-Webhook-Secret}).
+ * be triggered instead of polling. Each server has its own endpoint: set {@code WEBHOOK_URL_<guildId>}
+ * (and {@code WEBHOOK_SECRET_<guildId>}, sent in the header named by {@code WEBHOOK_SECRET_HEADER},
+ * default {@code X-Webhook-Secret}). A server message that mentions the bot, or lands in a channel
+ * listed in {@code WEBHOOK_CHANNEL_IDS}, goes to that server's endpoint as
+ * {@code "type":"channel_message"}. A DM ({@code "type":"dm_received"}) goes to exactly one server's
+ * endpoint: the one named for that user in {@code WEBHOOK_DM_OVERRIDES} ({@code userId:guildId,...}),
+ * else the first server in {@code WEBHOOK_DM_PRIORITY} (comma-separated guild IDs) the user is a
+ * member of. The payload carries {@code routedGuildId}/{@code routedGuildName} and
+ * {@code memberGuildIds} (every routed server the sender belongs to) so an agent can hand off a
+ * message that belongs to another business. Edits to any forwarded message are sent as
+ * {@code "type":"message_edited"} with the new content.
  * A delivery that fails with a network error or a 5xx is retried once after a short delay; a 4xx
  * is not retried, but the response body is logged so the rejection can be diagnosed.
  *
@@ -84,9 +92,16 @@ public class DmInboxService extends ListenerAdapter implements DisposableBean {
             .connectTimeout(Duration.ofSeconds(10))
             .build();
 
-    private final String webhookUrl;
-    private final String webhookSecret;
+    /** One server's agent endpoint. */
+    private record Route(String guildId, String guildName, String url, String secret) {}
+
     private final String webhookSecretHeader;
+    /** guild ID -> that server's webhook. Servers without a configured URL are not pushed anywhere. */
+    private final Map<String, Route> routes;
+    /** Guild IDs in the order used to pick one agent for a DM from someone in several servers. */
+    private final List<String> dmPriority;
+    /** user ID -> guild ID: force that person's DMs to a particular server's agent. */
+    private final Map<String, String> dmOverrides;
     private final Set<String> forwardedChannelIds;
     private final Path inboxFile;
     private final long coalesceMillis;
@@ -98,10 +113,11 @@ public class DmInboxService extends ListenerAdapter implements DisposableBean {
     });
 
     public DmInboxService(JDA jda,
-                          @Value("${WEBHOOK_URL:}") String webhookUrl,
-                          @Value("${WEBHOOK_SECRET:}") String webhookSecret,
+                          Environment env,
                           @Value("${WEBHOOK_SECRET_HEADER:X-Webhook-Secret}") String webhookSecretHeader,
                           @Value("${WEBHOOK_CHANNEL_IDS:}") String webhookChannelIds,
+                          @Value("${WEBHOOK_DM_PRIORITY:}") String dmPriority,
+                          @Value("${WEBHOOK_DM_OVERRIDES:}") String dmOverrides,
                           @Value("${WEBHOOK_COALESCE_SECONDS:45}") String coalesceSeconds,
                           @Value("${INBOX_FILE:}") String inboxFilePath) {
         this.jda = jda;
@@ -115,22 +131,86 @@ public class DmInboxService extends ListenerAdapter implements DisposableBean {
             coalesce = 45_000;
         }
         this.coalesceMillis = Math.max(0, coalesce);
-        this.webhookUrl = webhookUrl == null ? "" : webhookUrl.trim();
-        this.webhookSecret = webhookSecret == null ? "" : webhookSecret.trim();
         this.webhookSecretHeader = (webhookSecretHeader == null || webhookSecretHeader.isBlank())
                 ? "X-Webhook-Secret" : webhookSecretHeader.trim();
-        this.forwardedChannelIds = (webhookChannelIds == null || webhookChannelIds.isBlank())
-                ? Set.of()
-                : Arrays.stream(webhookChannelIds.split(","))
-                        .map(String::trim)
-                        .filter(s -> !s.isEmpty())
-                        .collect(Collectors.toUnmodifiableSet());
-        if (!this.webhookUrl.isEmpty()) {
-            System.out.println("Message webhook enabled: forwarding DMs, mentions of the bot, and "
-                    + forwardedChannelIds.size() + " watched channel(s)"
+        this.forwardedChannelIds = splitIds(webhookChannelIds).stream().collect(Collectors.toUnmodifiableSet());
+
+        // One webhook per server: WEBHOOK_URL_<guildId> and WEBHOOK_SECRET_<guildId>.
+        Map<String, Route> found = new LinkedHashMap<>();
+        for (Guild guild : jda.getGuilds()) {
+            String url = env.getProperty("WEBHOOK_URL_" + guild.getId(), "").trim();
+            if (url.isEmpty()) {
+                continue;
+            }
+            String secret = env.getProperty("WEBHOOK_SECRET_" + guild.getId(), "").trim();
+            found.put(guild.getId(), new Route(guild.getId(), guild.getName(), url, secret));
+        }
+        this.routes = Map.copyOf(found);
+
+        List<String> priority = new ArrayList<>(splitIds(dmPriority));
+        priority.removeIf(id -> !routes.containsKey(id));
+        for (String id : found.keySet()) { // any routed server not listed goes last, in server order
+            if (!priority.contains(id)) {
+                priority.add(id);
+            }
+        }
+        this.dmPriority = List.copyOf(priority);
+
+        Map<String, String> overrides = new HashMap<>();
+        for (String pair : splitIds(dmOverrides)) {
+            String[] parts = pair.split(":");
+            if (parts.length == 2 && routes.containsKey(parts[1].trim())) {
+                overrides.put(parts[0].trim(), parts[1].trim());
+            } else {
+                System.err.println("WEBHOOK_DM_OVERRIDES: ignoring '" + pair + "' (expected userId:guildId of a routed server)");
+            }
+        }
+        this.dmOverrides = Map.copyOf(overrides);
+
+        if (routes.isEmpty()) {
+            System.out.println("Message webhook disabled: no WEBHOOK_URL_<guildId> is set");
+        } else {
+            System.out.println("Message webhook enabled for " + routes.size() + " server(s): "
+                    + routes.values().stream().map(Route::guildName).collect(Collectors.joining(", "))
+                    + "; forwarding DMs, mentions of the bot, and " + forwardedChannelIds.size() + " watched channel(s)"
+                    + "; DM priority " + dmPriority.stream().map(id -> routes.get(id).guildName()).collect(Collectors.joining(" > "))
+                    + (dmOverrides.isEmpty() ? "" : "; " + dmOverrides.size() + " DM override(s)")
                     + (coalesceMillis > 0 ? "; coalescing bursts over " + (coalesceMillis / 1000.0) + "s" : "; no coalescing"));
+            for (Guild guild : jda.getGuilds()) {
+                if (!routes.containsKey(guild.getId())) {
+                    System.out.println("Message webhook: no WEBHOOK_URL_" + guild.getId() + " for server '" + guild.getName() + "', its messages are not pushed");
+                }
+            }
         }
         jda.addEventListener(this);
+    }
+
+    private static List<String> splitIds(String csv) {
+        if (csv == null || csv.isBlank()) {
+            return List.of();
+        }
+        return Arrays.stream(csv.split(",")).map(String::trim).filter(s -> !s.isEmpty()).toList();
+    }
+
+    /** Every routed server this user is a member of, in DM priority order. */
+    private List<String> memberGuildIds(User user) {
+        List<String> ids = new ArrayList<>();
+        for (String guildId : dmPriority) {
+            Guild guild = jda.getGuildById(guildId);
+            if (guild != null && guild.getMember(user) != null) {
+                ids.add(guildId);
+            }
+        }
+        return ids;
+    }
+
+    /** The server whose agent owns this user's DMs: an explicit override, else the first routed server they belong to. */
+    private String dmRouteFor(User user, List<String> memberGuildIds) {
+        String override = dmOverrides.get(user.getId());
+        if (override != null) {
+            return override;
+        }
+        return memberGuildIds.isEmpty() ? null : memberGuildIds.get(0);
     }
 
     private record InboxEntry(String messageId,
@@ -163,7 +243,7 @@ public class DmInboxService extends ListenerAdapter implements DisposableBean {
                 }
                 saveInbox();
             }
-            queueForWebhook("dm_received", entry, null, null, null, false);
+            queueDm("dm_received", author, entry);
             return;
         }
 
@@ -171,10 +251,23 @@ public class DmInboxService extends ListenerAdapter implements DisposableBean {
             return;
         }
         if (shouldForwardGuildMessage(message)) {
-            queueForWebhook("channel_message", entry,
-                    message.getGuild().getId(), message.getChannel().getId(), message.getChannel().getName(),
-                    mentionsBot(message));
+            queueForWebhook("channel_message", entry, message.getGuild().getId(), memberGuildIds(author),
+                    message.getChannel().getId(), message.getChannel().getName(), mentionsBot(message));
         }
+    }
+
+    /** Routes a DM to the one server agent that owns this person's DMs, if any. */
+    private void queueDm(String type, User author, InboxEntry entry) {
+        List<String> memberOf = memberGuildIds(author);
+        String routeGuildId = dmRouteFor(author, memberOf);
+        if (routeGuildId == null) {
+            if (!routes.isEmpty()) {
+                System.out.println("DM " + entry.messageId() + " from " + author.getName()
+                        + " not pushed: not a member of any routed server (still in the inbox)");
+            }
+            return;
+        }
+        queueForWebhook(type, entry, routeGuildId, memberOf, null, null, false);
     }
 
     /**
@@ -213,7 +306,7 @@ public class DmInboxService extends ListenerAdapter implements DisposableBean {
             }
             // Edited while the original is still held: the hold picks up the new text, no extra push.
             if (!updatePendingIfHeld("dm_received", edited, null)) {
-                queueForWebhook("message_edited", edited, null, null, null, false);
+                queueDm("message_edited", author, edited);
             }
             return;
         }
@@ -224,8 +317,8 @@ public class DmInboxService extends ListenerAdapter implements DisposableBean {
         if (shouldForwardGuildMessage(message)) {
             String channelId = message.getChannel().getId();
             if (!updatePendingIfHeld("channel_message", edited, channelId)) {
-                queueForWebhook("message_edited", edited,
-                        message.getGuild().getId(), channelId, message.getChannel().getName(), false);
+                queueForWebhook("message_edited", edited, message.getGuild().getId(), memberGuildIds(author),
+                        channelId, message.getChannel().getName(), false);
             }
         }
     }
@@ -330,39 +423,45 @@ public class DmInboxService extends ListenerAdapter implements DisposableBean {
     /** Messages from one sender (per channel) waiting to be pushed as a single webhook call. */
     private static final class Batch {
         final String type;
+        final Route route;
+        /** For channel messages, the server the channel is in; for DMs, the server whose agent was chosen. */
         final String guildId;
+        final List<String> memberGuildIds;
         final String channelId;
         final String channelName;
         final List<InboxEntry> entries = new ArrayList<>();
 
-        Batch(String type, String guildId, String channelId, String channelName) {
+        Batch(String type, Route route, String guildId, List<String> memberGuildIds, String channelId, String channelName) {
             this.type = type;
+            this.route = route;
             this.guildId = guildId;
+            this.memberGuildIds = memberGuildIds;
             this.channelId = channelId;
             this.channelName = channelName;
         }
     }
 
     /**
-     * Queues a message for the webhook. With coalescing on, the first message from a sender starts a
-     * short hold; anything more they send in that window (or an edit to a held message) joins the
-     * same push, so a thought typed as several messages reaches the agent as one event. Messages
-     * that {@code immediate} (the bot being @mentioned) skip the hold.
+     * Queues a message for the webhook of the server {@code guildId}. With coalescing on, the first
+     * message from a sender starts a short hold; anything more they send in that window (or an edit
+     * to a held message) joins the same push, so a thought typed as several messages reaches the
+     * agent as one event. Messages that are {@code immediate} (the bot being @mentioned) skip the hold.
      */
-    private void queueForWebhook(String type, InboxEntry e, String guildId, String channelId, String channelName,
-                                 boolean immediate) {
-        if (webhookUrl.isEmpty()) {
-            return;
+    private void queueForWebhook(String type, InboxEntry e, String guildId, List<String> memberGuildIds,
+                                 String channelId, String channelName, boolean immediate) {
+        Route route = routes.get(guildId);
+        if (route == null) {
+            return; // server has no agent webhook configured
         }
         if (coalesceMillis <= 0 || immediate) {
-            forwardToWebhook(new Batch(type, guildId, channelId, channelName), List.of(e), false);
+            forwardToWebhook(new Batch(type, route, guildId, memberGuildIds, channelId, channelName), List.of(e), false);
             return;
         }
         String key = type + ":" + e.userId() + ":" + (channelId == null ? "dm" : channelId);
         synchronized (pending) {
             Batch batch = pending.get(key);
             if (batch == null) {
-                batch = new Batch(type, guildId, channelId, channelName);
+                batch = new Batch(type, route, guildId, memberGuildIds, channelId, channelName);
                 pending.put(key, batch);
                 scheduler.schedule(() -> flush(key), coalesceMillis, TimeUnit.MILLISECONDS);
             }
@@ -433,9 +532,15 @@ public class DmInboxService extends ListenerAdapter implements DisposableBean {
         InboxEntry first = entries.get(0);
         String content = entries.stream().map(InboxEntry::content).collect(Collectors.joining("\n"));
         List<String> attachments = entries.stream().flatMap(x -> x.attachmentUrls().stream()).toList();
+        boolean dm = batch.channelId == null;
         String json = "{"
                 + "\"type\":\"" + batch.type + "\","
-                + "\"guildId\":" + jsonOrNull(batch.guildId) + ","
+                // guildId stays null for DMs (they have no server); routedGuildId says whose agent received it
+                + "\"guildId\":" + jsonOrNull(dm ? null : batch.guildId) + ","
+                + "\"routedGuildId\":\"" + escape(batch.guildId) + "\","
+                + "\"routedGuildName\":\"" + escape(batch.route.guildName()) + "\","
+                + "\"memberGuildIds\":[" + batch.memberGuildIds.stream()
+                        .map(x -> "\"" + escape(x) + "\"").collect(Collectors.joining(",")) + "],"
                 + "\"channelId\":" + jsonOrNull(batch.channelId) + ","
                 + "\"channelName\":" + jsonOrNull(batch.channelName) + ","
                 + "\"messageId\":\"" + escape(first.messageId()) + "\","
@@ -450,14 +555,15 @@ public class DmInboxService extends ListenerAdapter implements DisposableBean {
                 + "\"attachments\":[" + attachments.stream()
                         .map(u -> "\"" + escape(u) + "\"").collect(Collectors.joining(",")) + "]"
                 + "}";
-        HttpRequest.Builder request = HttpRequest.newBuilder(URI.create(webhookUrl))
+        HttpRequest.Builder request = HttpRequest.newBuilder(URI.create(batch.route.url()))
                 .timeout(Duration.ofSeconds(15))
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(json));
-        if (!webhookSecret.isEmpty()) {
-            request.header(webhookSecretHeader, webhookSecret);
+        if (!batch.route.secret().isEmpty()) {
+            request.header(webhookSecretHeader, batch.route.secret());
         }
-        String label = batch.type + " " + first.messageId() + (entries.size() > 1 ? " (+" + (entries.size() - 1) + ")" : "");
+        String label = batch.type + " " + first.messageId() + (entries.size() > 1 ? " (+" + (entries.size() - 1) + ")" : "")
+                + " -> " + batch.route.guildName();
         if (sync) {
             try {
                 HttpResponse<String> response = httpClient.send(request.build(), HttpResponse.BodyHandlers.ofString());
