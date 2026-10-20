@@ -173,8 +173,8 @@ public class DmInboxService extends ListenerAdapter implements DisposableBean {
             System.out.println("Message webhook enabled for " + routes.size() + " server(s): "
                     + routes.values().stream().map(Route::guildName).collect(Collectors.joining(", "))
                     + "; forwarding DMs, mentions of the bot, and " + forwardedChannelIds.size() + " watched channel(s)"
-                    + "; DM priority " + dmPriority.stream().map(id -> routes.get(id).guildName()).collect(Collectors.joining(" > "))
-                    + (dmOverrides.isEmpty() ? "" : "; " + dmOverrides.size() + " DM override(s)")
+                    + "; DM priority " + this.dmPriority.stream().map(id -> routes.get(id).guildName()).collect(Collectors.joining(" > "))
+                    + (this.dmOverrides.isEmpty() ? "" : "; " + this.dmOverrides.size() + " DM override(s)")
                     + (coalesceMillis > 0 ? "; coalescing bursts over " + (coalesceMillis / 1000.0) + "s" : "; no coalescing"));
             for (Guild guild : jda.getGuilds()) {
                 if (!routes.containsKey(guild.getId())) {
