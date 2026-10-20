@@ -10,6 +10,7 @@ import net.dv8tion.jda.api.events.message.MessageUpdateEvent;
 import net.dv8tion.jda.api.hooks.ListenerAdapter;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
+import org.springframework.beans.factory.DisposableBean;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
@@ -29,9 +30,13 @@ import java.util.Arrays;
 import java.util.Base64;
 import java.util.Comparator;
 import java.util.Deque;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
@@ -55,13 +60,19 @@ import java.util.stream.Collectors;
  * A delivery that fails with a network error or a 5xx is retried once after a short delay; a 4xx
  * is not retried, but the response body is logged so the rejection can be diagnosed.
  *
+ * Bursts are coalesced: the first message from a sender starts a hold of
+ * {@code WEBHOOK_COALESCE_SECONDS} (default 45, 0 disables), and anything more they send in that
+ * window, including edits to held messages, goes out in the same push with {@code content} joined
+ * by newlines and {@code messageIds}/{@code messageCount} listing what it covers. Messages that
+ * @mention the bot skip the hold. Held messages are flushed on shutdown.
+ *
  * The inbox holds at most {@link #MAX_INBOX_SIZE} messages (oldest dropped first). Set
  * {@code INBOX_FILE} to a path on persistent storage (e.g. a mounted volume) and the inbox is
  * written there on every change and reloaded on startup, so a restart or redeploy loses nothing.
  * Without it the inbox is memory-only and empty after each restart.
  */
 @Service
-public class DmInboxService extends ListenerAdapter {
+public class DmInboxService extends ListenerAdapter implements DisposableBean {
 
     /** About two weeks of DMs at a few hundred per day. */
     private static final int MAX_INBOX_SIZE = 3000;
@@ -78,16 +89,32 @@ public class DmInboxService extends ListenerAdapter {
     private final String webhookSecretHeader;
     private final Set<String> forwardedChannelIds;
     private final Path inboxFile;
+    private final long coalesceMillis;
+    private final Map<String, Batch> pending = new HashMap<>();
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "webhook-coalesce");
+        t.setDaemon(true);
+        return t;
+    });
 
     public DmInboxService(JDA jda,
                           @Value("${WEBHOOK_URL:}") String webhookUrl,
                           @Value("${WEBHOOK_SECRET:}") String webhookSecret,
                           @Value("${WEBHOOK_SECRET_HEADER:X-Webhook-Secret}") String webhookSecretHeader,
                           @Value("${WEBHOOK_CHANNEL_IDS:}") String webhookChannelIds,
+                          @Value("${WEBHOOK_COALESCE_SECONDS:45}") String coalesceSeconds,
                           @Value("${INBOX_FILE:}") String inboxFilePath) {
         this.jda = jda;
         this.inboxFile = (inboxFilePath == null || inboxFilePath.isBlank()) ? null : Path.of(inboxFilePath.trim());
         loadInbox();
+        long coalesce;
+        try {
+            coalesce = Math.round(Double.parseDouble(coalesceSeconds.trim()) * 1000);
+        } catch (Exception ex) {
+            System.err.println("WEBHOOK_COALESCE_SECONDS '" + coalesceSeconds + "' is not a number; using 45");
+            coalesce = 45_000;
+        }
+        this.coalesceMillis = Math.max(0, coalesce);
         this.webhookUrl = webhookUrl == null ? "" : webhookUrl.trim();
         this.webhookSecret = webhookSecret == null ? "" : webhookSecret.trim();
         this.webhookSecretHeader = (webhookSecretHeader == null || webhookSecretHeader.isBlank())
@@ -100,7 +127,8 @@ public class DmInboxService extends ListenerAdapter {
                         .collect(Collectors.toUnmodifiableSet());
         if (!this.webhookUrl.isEmpty()) {
             System.out.println("Message webhook enabled: forwarding DMs, mentions of the bot, and "
-                    + forwardedChannelIds.size() + " watched channel(s)");
+                    + forwardedChannelIds.size() + " watched channel(s)"
+                    + (coalesceMillis > 0 ? "; coalescing bursts over " + (coalesceMillis / 1000.0) + "s" : "; no coalescing"));
         }
         jda.addEventListener(this);
     }
@@ -135,7 +163,7 @@ public class DmInboxService extends ListenerAdapter {
                 }
                 saveInbox();
             }
-            forwardToWebhook("dm_received", entry, null, null, null);
+            queueForWebhook("dm_received", entry, null, null, null, false);
             return;
         }
 
@@ -143,8 +171,9 @@ public class DmInboxService extends ListenerAdapter {
             return;
         }
         if (shouldForwardGuildMessage(message)) {
-            forwardToWebhook("channel_message", entry,
-                    message.getGuild().getId(), message.getChannel().getId(), message.getChannel().getName());
+            queueForWebhook("channel_message", entry,
+                    message.getGuild().getId(), message.getChannel().getId(), message.getChannel().getName(),
+                    mentionsBot(message));
         }
     }
 
@@ -182,7 +211,10 @@ public class DmInboxService extends ListenerAdapter {
                     saveInbox();
                 }
             }
-            forwardToWebhook("message_edited", edited, null, null, null);
+            // Edited while the original is still held: the hold picks up the new text, no extra push.
+            if (!updatePendingIfHeld("dm_received", edited, null)) {
+                queueForWebhook("message_edited", edited, null, null, null, false);
+            }
             return;
         }
 
@@ -190,8 +222,11 @@ public class DmInboxService extends ListenerAdapter {
             return;
         }
         if (shouldForwardGuildMessage(message)) {
-            forwardToWebhook("message_edited", edited,
-                    message.getGuild().getId(), message.getChannel().getId(), message.getChannel().getName());
+            String channelId = message.getChannel().getId();
+            if (!updatePendingIfHeld("channel_message", edited, channelId)) {
+                queueForWebhook("message_edited", edited,
+                        message.getGuild().getId(), channelId, message.getChannel().getName(), false);
+            }
         }
     }
 
@@ -210,9 +245,11 @@ public class DmInboxService extends ListenerAdapter {
     }
 
     private boolean shouldForwardGuildMessage(Message message) {
-        boolean watchedChannel = forwardedChannelIds.contains(message.getChannel().getId());
-        boolean mentionsBot = message.getMentions().isMentioned(jda.getSelfUser(), Message.MentionType.USER);
-        return watchedChannel || mentionsBot;
+        return forwardedChannelIds.contains(message.getChannel().getId()) || mentionsBot(message);
+    }
+
+    private boolean mentionsBot(Message message) {
+        return message.getMentions().isMentioned(jda.getSelfUser(), Message.MentionType.USER);
     }
 
     /**
@@ -288,22 +325,129 @@ public class DmInboxService extends ListenerAdapter {
         return sb.toString();
     }
 
-    private void forwardToWebhook(String type, InboxEntry e, String guildId, String channelId, String channelName) {
+    // ---- webhook delivery, with per-sender coalescing ----
+
+    /** Messages from one sender (per channel) waiting to be pushed as a single webhook call. */
+    private static final class Batch {
+        final String type;
+        final String guildId;
+        final String channelId;
+        final String channelName;
+        final List<InboxEntry> entries = new ArrayList<>();
+
+        Batch(String type, String guildId, String channelId, String channelName) {
+            this.type = type;
+            this.guildId = guildId;
+            this.channelId = channelId;
+            this.channelName = channelName;
+        }
+    }
+
+    /**
+     * Queues a message for the webhook. With coalescing on, the first message from a sender starts a
+     * short hold; anything more they send in that window (or an edit to a held message) joins the
+     * same push, so a thought typed as several messages reaches the agent as one event. Messages
+     * that {@code immediate} (the bot being @mentioned) skip the hold.
+     */
+    private void queueForWebhook(String type, InboxEntry e, String guildId, String channelId, String channelName,
+                                 boolean immediate) {
         if (webhookUrl.isEmpty()) {
             return;
         }
+        if (coalesceMillis <= 0 || immediate) {
+            forwardToWebhook(new Batch(type, guildId, channelId, channelName), List.of(e), false);
+            return;
+        }
+        String key = type + ":" + e.userId() + ":" + (channelId == null ? "dm" : channelId);
+        synchronized (pending) {
+            Batch batch = pending.get(key);
+            if (batch == null) {
+                batch = new Batch(type, guildId, channelId, channelName);
+                pending.put(key, batch);
+                scheduler.schedule(() -> flush(key), coalesceMillis, TimeUnit.MILLISECONDS);
+            }
+            boolean replaced = false;
+            for (int i = 0; i < batch.entries.size(); i++) {
+                if (batch.entries.get(i).messageId().equals(e.messageId())) {
+                    batch.entries.set(i, e); // edited while held: push the final text only
+                    replaced = true;
+                    break;
+                }
+            }
+            if (!replaced) {
+                batch.entries.add(e);
+            }
+        }
+    }
+
+    /** True if the sender still has this message waiting in a hold, in which case an edit just updates it. */
+    private boolean updatePendingIfHeld(String type, InboxEntry edited, String channelId) {
+        String key = type + ":" + edited.userId() + ":" + (channelId == null ? "dm" : channelId);
+        synchronized (pending) {
+            Batch batch = pending.get(key);
+            if (batch == null) {
+                return false;
+            }
+            for (int i = 0; i < batch.entries.size(); i++) {
+                if (batch.entries.get(i).messageId().equals(edited.messageId())) {
+                    batch.entries.set(i, edited);
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+
+    private void flush(String key) {
+        Batch batch;
+        synchronized (pending) {
+            batch = pending.remove(key);
+        }
+        if (batch != null && !batch.entries.isEmpty()) {
+            forwardToWebhook(batch, batch.entries, false);
+        }
+    }
+
+    /** Pushes whatever is still held, synchronously, so a shutdown or redeploy does not drop a batch. */
+    @Override
+    public void destroy() {
+        List<Batch> remaining;
+        synchronized (pending) {
+            remaining = new ArrayList<>(pending.values());
+            pending.clear();
+        }
+        for (Batch batch : remaining) {
+            if (!batch.entries.isEmpty()) {
+                forwardToWebhook(batch, batch.entries, true);
+            }
+        }
+        scheduler.shutdownNow();
+    }
+
+    /**
+     * Builds and sends one webhook call for one or more messages from the same sender. The payload
+     * keeps the single-message fields (messageId and receivedAt are the first message's, content is
+     * all messages joined by newlines) and adds messageIds and messageCount.
+     */
+    private void forwardToWebhook(Batch batch, List<InboxEntry> entries, boolean sync) {
+        InboxEntry first = entries.get(0);
+        String content = entries.stream().map(InboxEntry::content).collect(Collectors.joining("\n"));
+        List<String> attachments = entries.stream().flatMap(x -> x.attachmentUrls().stream()).toList();
         String json = "{"
-                + "\"type\":\"" + type + "\","
-                + "\"guildId\":" + jsonOrNull(guildId) + ","
-                + "\"channelId\":" + jsonOrNull(channelId) + ","
-                + "\"channelName\":" + jsonOrNull(channelName) + ","
-                + "\"messageId\":\"" + escape(e.messageId()) + "\","
-                + "\"userId\":\"" + escape(e.userId()) + "\","
-                + "\"username\":\"" + escape(e.username()) + "\","
-                + "\"displayName\":\"" + escape(e.displayName()) + "\","
-                + "\"receivedAt\":\"" + escape(e.receivedAt().toString()) + "\","
-                + "\"content\":\"" + escape(e.content()) + "\","
-                + "\"attachments\":[" + e.attachmentUrls().stream()
+                + "\"type\":\"" + batch.type + "\","
+                + "\"guildId\":" + jsonOrNull(batch.guildId) + ","
+                + "\"channelId\":" + jsonOrNull(batch.channelId) + ","
+                + "\"channelName\":" + jsonOrNull(batch.channelName) + ","
+                + "\"messageId\":\"" + escape(first.messageId()) + "\","
+                + "\"messageIds\":[" + entries.stream()
+                        .map(x -> "\"" + escape(x.messageId()) + "\"").collect(Collectors.joining(",")) + "],"
+                + "\"messageCount\":" + entries.size() + ","
+                + "\"userId\":\"" + escape(first.userId()) + "\","
+                + "\"username\":\"" + escape(first.username()) + "\","
+                + "\"displayName\":\"" + escape(first.displayName()) + "\","
+                + "\"receivedAt\":\"" + escape(first.receivedAt().toString()) + "\","
+                + "\"content\":\"" + escape(content) + "\","
+                + "\"attachments\":[" + attachments.stream()
                         .map(u -> "\"" + escape(u) + "\"").collect(Collectors.joining(",")) + "]"
                 + "}";
         HttpRequest.Builder request = HttpRequest.newBuilder(URI.create(webhookUrl))
@@ -313,7 +457,19 @@ public class DmInboxService extends ListenerAdapter {
         if (!webhookSecret.isEmpty()) {
             request.header(webhookSecretHeader, webhookSecret);
         }
-        sendWebhook(request.build(), type + " " + e.messageId(), 1);
+        String label = batch.type + " " + first.messageId() + (entries.size() > 1 ? " (+" + (entries.size() - 1) + ")" : "");
+        if (sync) {
+            try {
+                HttpResponse<String> response = httpClient.send(request.build(), HttpResponse.BodyHandlers.ofString());
+                if (response.statusCode() >= 300) {
+                    System.err.println("Message webhook returned HTTP " + response.statusCode() + " for " + label + " during shutdown flush");
+                }
+            } catch (Exception ex) {
+                System.err.println("Message webhook delivery failed for " + label + " during shutdown flush: " + ex.getMessage());
+            }
+            return;
+        }
+        sendWebhook(request.build(), label, 1);
     }
 
     /**
