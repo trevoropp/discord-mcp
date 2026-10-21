@@ -110,13 +110,33 @@ public class DmLogService extends ListenerAdapter {
             if (author.isBot() && !fromBot) {
                 return;
             }
-            // The member whose conversation this is: the sender for incoming DMs, the recipient for the bot's replies.
-            User member = fromBot ? otherParty(message) : author;
-            if (member == null) {
+            if (!fromBot) {
+                mirror(message, author, false, edited);
                 return;
             }
+            // The bot's own reply: the recipient comes from the DM channel. JDA drops idle DM channels
+            // from its cache, in which case the recipient is unknown locally and has to be fetched.
+            PrivateChannel pc = message.getChannel().asPrivateChannel();
+            User recipient = pc.getUser();
+            if (recipient != null) {
+                mirror(message, recipient, true, edited);
+                return;
+            }
+            pc.retrieveUser().queue(
+                    user -> mirror(message, user, true, edited),
+                    err -> System.err.println("DM log: could not resolve the recipient of the bot's message "
+                            + message.getId() + " in DM channel " + pc.getId() + ": " + err.getMessage()));
+        } catch (Exception ex) {
+            System.err.println("DM log: failed to mirror message " + message.getId() + ": " + ex.getMessage());
+        }
+    }
+
+    private void mirror(Message message, User member, boolean fromBot, boolean edited) {
+        try {
             List<TextChannel> targets = targetsFor(member);
             if (targets.isEmpty()) {
+                System.out.println("DM log: " + (fromBot ? "reply to " : "DM from ") + member.getName()
+                        + " (" + member.getId() + ") not mirrored: not a member of any mapped server");
                 return;
             }
             String text = render(message, member, fromBot, edited);
@@ -129,14 +149,6 @@ public class DmLogService extends ListenerAdapter {
         } catch (Exception ex) {
             System.err.println("DM log: failed to mirror message " + message.getId() + ": " + ex.getMessage());
         }
-    }
-
-    private User otherParty(Message message) {
-        if (message.getChannelType() != ChannelType.PRIVATE) {
-            return null;
-        }
-        PrivateChannel pc = message.getChannel().asPrivateChannel();
-        return pc.getUser();
     }
 
     private List<TextChannel> targetsFor(User member) {
