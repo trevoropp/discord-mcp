@@ -209,7 +209,7 @@ public class MessageService {
      * One call that returns everything new across many channels, so a periodic sweep is a single
      * request instead of one read_messages call per channel.
      */
-    @Tool(name = "get_updates_since", description = "Return all new messages across channels since a point in time, grouped by server and channel, oldest first. Use this for a periodic sweep instead of calling read_messages on each channel. Give either sinceMinutes (e.g. 30) or since (ISO date-time). By default covers every text channel the bot can read in every server; pass channelIds to narrow it. Messages from bots are skipped unless includeBots is true. A channel that hits limitPerChannel is marked truncated; use read_messages with after to page it.")
+    @Tool(name = "get_updates_since", description = "Return all new messages across channels since a point in time, grouped by server and channel, oldest first. Use this for a periodic sweep instead of calling read_messages on each channel. Give either sinceMinutes (e.g. 30) or since (ISO date-time). By default covers every text channel the bot can read in every server; pass channelIds to narrow it. Messages from bots are skipped unless includeBots is true. A channel that hits limitPerChannel is marked truncated; use read_messages with after to page it. The reply ends with nextSince: pass that value as since on the next sweep so consecutive sweeps neither overlap nor leave a gap.")
     public String getUpdatesSince(@ToolParam(description = "Look back this many minutes (1-10080). Ignored if since is given.", required = false) String sinceMinutes,
                                   @ToolParam(description = "Only messages sent at or after this time. ISO date-time, e.g. 2026-10-07T08:00:00-10:00", required = false) String since,
                                   @ToolParam(description = "Comma-separated channel IDs to check. Omit to check every readable text channel in every server.", required = false) String channelIds,
@@ -256,10 +256,22 @@ public class MessageService {
             }
         }
 
+        // Taken before any channel is read, so passing it back as `since` next time leaves no gap.
+        Instant sweepStart = Instant.now();
+        long cursorLong = Long.parseUnsignedLong(cursor);
+
         StringBuilder out = new StringBuilder();
         int total = 0;
         int channelsWithNews = 0;
+        int skipped = 0;
         for (MessageChannel channel : channels) {
+            // JDA tracks each channel's latest message ID from the gateway; if nothing has been posted
+            // since the cursor there is no need to hit the API at all. 0 means unknown, so read it.
+            long latest = channel.getLatestMessageIdLong();
+            if (latest != 0 && Long.compareUnsigned(latest, cursorLong) <= 0) {
+                skipped++;
+                continue;
+            }
             List<Message> messages;
             try {
                 messages = new ArrayList<>(channel.getHistoryAfter(cursor, perChannel).complete().getRetrievedHistory());
@@ -272,6 +284,11 @@ public class MessageService {
                 messages.removeIf(m -> m.getAuthor().isBot());
             }
             if (messages.isEmpty()) {
+                if (truncated) {
+                    // The page was full of bot posts; human messages may be hiding behind them.
+                    out.append("\n### ").append(describeChannel(channel))
+                            .append(" (0 shown, truncated: page was all bot messages; use read_messages with after to page)\n");
+                }
                 continue;
             }
             messages.sort((a, b) -> a.getTimeCreated().compareTo(b.getTimeCreated()));
@@ -281,11 +298,13 @@ public class MessageService {
                     .append(" (").append(messages.size()).append(truncated ? ", truncated" : "").append(")\n");
             out.append(String.join("\n", formatMessages(messages))).append("\n");
         }
-        if (total == 0) {
-            return "No new messages since " + sinceTime + " in " + channels.size() + " channel(s).";
+        String footer = "\nnextSince: " + sweepStart + "  (pass this as `since` on the next sweep for a gap-free follow-on)";
+        if (total == 0 && out.isEmpty()) {
+            return "No new messages since " + sinceTime + " in " + channels.size() + " channel(s)"
+                    + (skipped > 0 ? " (" + skipped + " had no activity and were not read)" : "") + "." + footer;
         }
         return "**" + total + " new message(s) in " + channelsWithNews + " of " + channels.size()
-                + " channel(s) since " + sinceTime + ":**\n" + out;
+                + " channel(s) since " + sinceTime + ":**\n" + out + footer;
     }
 
     private String describeChannel(MessageChannel channel) {
