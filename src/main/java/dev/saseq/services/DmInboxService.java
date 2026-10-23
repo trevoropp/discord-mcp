@@ -502,8 +502,15 @@ public class DmInboxService extends ListenerAdapter implements DisposableBean {
         synchronized (pending) {
             batch = pending.remove(key);
         }
-        if (batch != null && !batch.entries.isEmpty()) {
+        if (batch == null || batch.entries.isEmpty()) {
+            return;
+        }
+        try {
             forwardToWebhook(batch, batch.entries, false);
+        } catch (Exception ex) {
+            // Runs on the scheduler thread, which would otherwise swallow this and drop the batch unlogged.
+            System.err.println("Message webhook: failed to send " + batch.type + " " + batch.entries.get(0).messageId()
+                    + " (+" + (batch.entries.size() - 1) + ") to " + batch.route.guildName() + ": " + ex.getMessage());
         }
     }
 
