@@ -358,7 +358,7 @@ public class DmInboxService extends ListenerAdapter implements DisposableBean {
     /**
      * Lists DMs the bot has received. By default returns only unread ones and marks them read.
      */
-    @Tool(name = "check_dm_inbox", description = "List direct messages sent to the bot. Returns unread DMs by default and marks them as read, so each call shows what is new since the last check. Use this to find out who has messaged the bot, then reply with send_private_message using the sender's user ID. Output is compact: one line per DM with local time, name, user ID, [unread] flag and text. The inbox is saved to disk and survives bot restarts and redeploys; it keeps the most recent " + MAX_INBOX_SIZE + " DMs (roughly two weeks), oldest dropped first.")
+    @Tool(name = "check_dm_inbox", description = "List direct messages sent to the bot. A DM is marked read automatically once its webhook push is accepted by an agent or the bot replies to that user, so unread means no agent has received it yet. Returns unread DMs by default and marks them as read, so each call shows what still needs attention. Use this to find out who has messaged the bot, then reply with send_private_message using the sender's user ID. Output is compact: one line per DM with local time, name, user ID, [unread] flag and text. The inbox is saved to disk and survives bot restarts and redeploys; it keeps the most recent " + MAX_INBOX_SIZE + " DMs (roughly two weeks), oldest dropped first.")
     public String checkDmInbox(@ToolParam(description = "true (default) = only DMs not yet returned by a previous call; false = every DM kept in the inbox", required = false) String unreadOnly,
                                @ToolParam(description = "true (default) = mark the returned DMs as read; false = leave them unread so the next call returns them again", required = false) String markAsRead,
                                @ToolParam(description = "Only return DMs from this user ID", required = false) String fromUserId) {
@@ -424,6 +424,44 @@ public class DmInboxService extends ListenerAdapter implements DisposableBean {
             sb.append(" [📎 ").append(url).append("]");
         }
         return sb.toString();
+    }
+
+    /** Marks the given inbox messages read. Returns how many changed. No-op for IDs not in the inbox. */
+    public int markRead(java.util.Collection<String> messageIds) {
+        if (messageIds == null || messageIds.isEmpty()) {
+            return 0;
+        }
+        Set<String> ids = new java.util.HashSet<>(messageIds);
+        return markReadWhere(e -> e.unread() && ids.contains(e.messageId()));
+    }
+
+    /** Marks every unread DM from this user read, e.g. because the bot just replied to them. */
+    public int markReadFromUser(String userId) {
+        if (userId == null || userId.isBlank()) {
+            return 0;
+        }
+        return markReadWhere(e -> e.unread() && userId.equals(e.userId()));
+    }
+
+    private int markReadWhere(java.util.function.Predicate<InboxEntry> which) {
+        int changed = 0;
+        synchronized (inbox) {
+            List<InboxEntry> updated = new ArrayList<>(inbox.size());
+            for (InboxEntry e : inbox) {
+                if (which.test(e)) {
+                    updated.add(e.markRead());
+                    changed++;
+                } else {
+                    updated.add(e);
+                }
+            }
+            if (changed > 0) {
+                inbox.clear();
+                inbox.addAll(updated);
+                saveInbox();
+            }
+        }
+        return changed;
     }
 
     // ---- webhook delivery, with per-sender coalescing ----
@@ -571,17 +609,17 @@ public class DmInboxService extends ListenerAdapter implements DisposableBean {
             history = channel == null ? null : channel.getHistoryBefore(first.messageId(), CONTEXT_MESSAGES);
         }
         if (history == null) {
-            sendWebhook(buildRequest(batch, entries, "[]", false), buildRequest(batch, entries, "[]", true), label, 1);
+            sendWebhook(buildRequest(batch, entries, "[]", false), buildRequest(batch, entries, "[]", true), label, 1, inboxIds(batch, entries));
             return;
         }
         history.queue(
                 h -> {
                     String ctx = recentMessagesJson(h.getRetrievedHistory());
-                    sendWebhook(buildRequest(batch, entries, ctx, false), buildRequest(batch, entries, ctx, true), label, 1);
+                    sendWebhook(buildRequest(batch, entries, ctx, false), buildRequest(batch, entries, ctx, true), label, 1, inboxIds(batch, entries));
                 },
                 err -> {
                     System.err.println("Message webhook: could not fetch context for " + label + ": " + err.getMessage() + "; sending without it");
-                    sendWebhook(buildRequest(batch, entries, "[]", false), buildRequest(batch, entries, "[]", true), label, 1);
+                    sendWebhook(buildRequest(batch, entries, "[]", false), buildRequest(batch, entries, "[]", true), label, 1, inboxIds(batch, entries));
                 });
     }
 
@@ -669,17 +707,24 @@ public class DmInboxService extends ListenerAdapter implements DisposableBean {
      * {@link #WEBHOOK_RETRY_DELAY}; a 4xx means the receiver rejected the payload, so it is
      * logged with the response body and not retried.
      */
-    private void sendWebhook(HttpRequest request, HttpRequest retryRequest, String label, int attempt) {
+    /** Inbox IDs a batch covers: only DMs live in the inbox, channel messages do not. */
+    private static List<String> inboxIds(Batch batch, List<InboxEntry> entries) {
+        return batch.channelId == null ? entries.stream().map(InboxEntry::messageId).toList() : List.of();
+    }
+
+    private void sendWebhook(HttpRequest request, HttpRequest retryRequest, String label, int attempt, List<String> inboxIds) {
         httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
                 .thenAccept(response -> {
                     int status = response.statusCode();
                     if (status < 300) {
+                        // Delivered to an agent: these DMs no longer need the fallback sweep.
+                        markRead(inboxIds);
                         return;
                     }
                     if (status >= 500 && attempt == 1) {
                         System.err.println("Message webhook returned HTTP " + status + " for " + label
                                 + "; retrying once");
-                        retryWebhook(retryRequest, label);
+                        retryWebhook(retryRequest, label, inboxIds);
                         return;
                     }
                     String body = response.body() == null ? "" : response.body().strip();
@@ -694,7 +739,7 @@ public class DmInboxService extends ListenerAdapter implements DisposableBean {
                     if (attempt == 1) {
                         System.err.println("Message webhook delivery failed for " + label + ": "
                                 + ex.getMessage() + "; retrying once");
-                        retryWebhook(retryRequest, label);
+                        retryWebhook(retryRequest, label, inboxIds);
                     } else {
                         System.err.println("Message webhook delivery failed for " + label
                                 + " after retry: " + ex.getMessage());
@@ -704,9 +749,9 @@ public class DmInboxService extends ListenerAdapter implements DisposableBean {
     }
 
     /** The retry carries isRetry:true so a receiver that already handled the first attempt can skip it. */
-    private void retryWebhook(HttpRequest retryRequest, String label) {
+    private void retryWebhook(HttpRequest retryRequest, String label, List<String> inboxIds) {
         CompletableFuture.delayedExecutor(WEBHOOK_RETRY_DELAY.toMillis(), TimeUnit.MILLISECONDS)
-                .execute(() -> sendWebhook(retryRequest, retryRequest, label, 2));
+                .execute(() -> sendWebhook(retryRequest, retryRequest, label, 2, inboxIds));
     }
 
     // ---- persistence (one entry per line, fields tab-separated, free text base64-encoded) ----
