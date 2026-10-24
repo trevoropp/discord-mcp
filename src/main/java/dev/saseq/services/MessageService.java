@@ -30,9 +30,11 @@ import java.util.List;
 public class MessageService {
 
     private final JDA jda;
+    private final CompactFormatter compact;
 
-    public MessageService(JDA jda) {
+    public MessageService(JDA jda, CompactFormatter compact) {
         this.jda = jda;
+        this.compact = compact;
     }
 
     /**
@@ -155,7 +157,7 @@ public class MessageService {
      * @param around    Optional message ID to fetch messages around this message.
      * @return A formatted string containing the retrieved messages.
      */
-    @Tool(name = "read_messages", description = "Read message history from a specific channel. Each message shows the author's user ID, username, display name and server nickname; mentions stay in raw <@id> form with a legend of who they are. Use count to limit how many messages come back, and before/after/around (message IDs) or since/until (dates) to narrow the range.")
+    @Tool(name = "read_messages", description = "Read message history from a specific channel, oldest first. Default output is compact: one line per message with local time, the sender's name (server nickname when set), the text with mentions resolved, and attachment names; the oldest and newest message IDs are given once at the end for paging. Pass verbose=true to get per-message IDs, user IDs, usernames and mention details. Use count to limit how many messages come back, and before/after/around (message IDs) or since/until (dates) to narrow the range.")
     public String readMessages(@ToolParam(description = "Discord channel ID") String channelId,
                                @ToolParam(description = "Number of messages to retrieve, 1-100 (default 25)", required = false) String count,
                                @ToolParam(description = "Message ID to fetch messages before this message", required = false) String before,
@@ -163,7 +165,8 @@ public class MessageService {
                                @ToolParam(description = "Message ID to fetch messages around this message", required = false) String around,
                                @ToolParam(description = "Same as count; accepted for convenience", required = false) String limit,
                                @ToolParam(description = "Only messages sent at or after this time. ISO date or date-time, e.g. 2026-10-07 or 2026-10-07T08:00:00-10:00 (a bare date means 00:00 UTC). Returns the oldest matching messages first.", required = false) String since,
-                               @ToolParam(description = "Only messages sent before this time. Same format as since.", required = false) String until) {
+                               @ToolParam(description = "Only messages sent before this time. Same format as since.", required = false) String until,
+                               @ToolParam(description = "true = full detail per message (IDs, user IDs, usernames, mention legend). Default false = compact one-line format.", required = false) String verbose) {
         if (channelId == null || channelId.isEmpty()) {
             throw new IllegalArgumentException("channelId cannot be null");
         }
@@ -201,6 +204,9 @@ public class MessageService {
         } else {
             messages = channel.getHistory().retrievePast(max).complete();
         }
+        if (!"true".equalsIgnoreCase(verbose)) {
+            return compact.page(messages);
+        }
         List<String> formatedMessages = formatMessages(messages);
         return "**Retrieved " + messages.size() + " messages:** \n" + String.join("\n", formatedMessages);
     }
@@ -209,13 +215,15 @@ public class MessageService {
      * One call that returns everything new across many channels, so a periodic sweep is a single
      * request instead of one read_messages call per channel.
      */
-    @Tool(name = "get_updates_since", description = "Return all new messages across channels since a point in time, grouped by server and channel, oldest first. Use this for a periodic sweep instead of calling read_messages on each channel. Give either sinceMinutes (e.g. 30) or since (ISO date-time). By default covers every text channel the bot can read in every server; pass channelIds to narrow it. Messages from bots are skipped unless includeBots is true. A channel that hits limitPerChannel is marked truncated; use read_messages with after to page it. The reply ends with nextSince: pass that value as since on the next sweep so consecutive sweeps neither overlap nor leave a gap.")
+    @Tool(name = "get_updates_since", description = "Return all new messages across channels since a point in time, grouped by server and channel, oldest first. Use this for a periodic sweep instead of calling read_messages on each channel. Give either sinceMinutes (e.g. 30) or since (ISO date-time). By default covers every text channel the bot can read in every server; pass channelIds to narrow it. Messages from bots are skipped unless includeBots is true. A channel that hits limitPerChannel is marked truncated; use read_messages with after to page it. The reply ends with nextSince: pass that value as since on the next sweep so consecutive sweeps neither overlap nor leave a gap. Output is compact by default (local time, name, text); verbose=true adds IDs, user IDs and mention details.")
     public String getUpdatesSince(@ToolParam(description = "Look back this many minutes (1-10080). Ignored if since is given.", required = false) String sinceMinutes,
                                   @ToolParam(description = "Only messages sent at or after this time. ISO date-time, e.g. 2026-10-07T08:00:00-10:00", required = false) String since,
                                   @ToolParam(description = "Comma-separated channel IDs to check. Omit to check every readable text channel in every server.", required = false) String channelIds,
                                   @ToolParam(description = "Max messages per channel, 1-100 (default 50)", required = false) String limitPerChannel,
-                                  @ToolParam(description = "true = include messages posted by bots (default false)", required = false) String includeBots) {
+                                  @ToolParam(description = "true = include messages posted by bots (default false)", required = false) String includeBots,
+                                  @ToolParam(description = "true = full detail per message (IDs, user IDs, usernames, mention legend). Default false = compact one-line format.", required = false) String verbose) {
         Instant sinceTime = parseTime(since, "since");
+        boolean full = "true".equalsIgnoreCase(verbose);
         if (sinceTime == null) {
             int minutes = 30;
             if (isProvided(sinceMinutes)) {
@@ -295,10 +303,16 @@ public class MessageService {
             channelsWithNews++;
             total += messages.size();
             out.append("\n### ").append(describeChannel(channel))
-                    .append(" (").append(messages.size()).append(truncated ? ", truncated" : "").append(")\n");
-            out.append(String.join("\n", formatMessages(messages))).append("\n");
+                    .append(" (").append(messages.size()).append(truncated ? ", truncated" : "")
+                    .append(full ? "" : "; newest ID " + messages.get(messages.size() - 1).getId()).append(")\n");
+            if (full) {
+                out.append(String.join("\n", formatMessages(messages))).append("\n");
+            } else {
+                out.append(messages.stream().map(compact::line).collect(java.util.stream.Collectors.joining("\n"))).append("\n");
+            }
         }
-        String footer = "\nnextSince: " + sweepStart + "  (pass this as `since` on the next sweep for a gap-free follow-on)";
+        String footer = "\nnextSince: " + sweepStart + "  (pass this as `since` on the next sweep for a gap-free follow-on"
+                + (full ? ")" : "; times " + compact.zone().getId() + ", verbose=true for IDs and usernames)");
         if (total == 0 && out.isEmpty()) {
             return "No new messages since " + sinceTime + " in " + channels.size() + " channel(s)"
                     + (skipped > 0 ? " (" + skipped + " had no activity and were not read)" : "") + "." + footer;

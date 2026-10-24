@@ -19,12 +19,14 @@ import java.util.stream.Collectors;
 public class UserService {
 
     private final JDA jda;
+    private final CompactFormatter compact;
 
     @Value("${DISCORD_GUILD_ID:}")
     private String defaultGuildId;
 
-    public UserService(JDA jda) {
+    public UserService(JDA jda, CompactFormatter compact) {
         this.jda = jda;
+        this.compact = compact;
     }
 
     private String resolveGuildId(String guildId) {
@@ -251,12 +253,14 @@ public class UserService {
      * @param around  Optional message ID to fetch messages around this message.
      * @return A formatted string containing the retrieved private messages.
      */
-    @Tool(name = "read_private_messages", description = "Read private message history from a specific user, optionally paginated with before/after/around")
+    @Tool(name = "read_private_messages", description = "Read the DM conversation with a user, oldest first, including the bot's own replies. Default is the most recent 10 messages in a compact one-line-per-message format (local time, name, text, attachment names); the oldest and newest message IDs are given once at the end for paging. Narrow with before/after/around (message IDs) or since (ISO date-time: only messages at or after that time). Pass verbose=true for per-message IDs and user IDs.")
     public String readPrivateMessages(@ToolParam(description = "Discord user ID") String userId,
-                                      @ToolParam(description = "Number of messages to retrieve, 1-100 (default 25)", required = false) String count,
+                                      @ToolParam(description = "Number of messages to retrieve, 1-100 (default 10)", required = false) String count,
                                       @ToolParam(description = "Message ID to fetch messages before this message", required = false) String before,
                                       @ToolParam(description = "Message ID to fetch messages after this message", required = false) String after,
-                                      @ToolParam(description = "Message ID to fetch messages around this message", required = false) String around) {
+                                      @ToolParam(description = "Message ID to fetch messages around this message", required = false) String around,
+                                      @ToolParam(description = "Only messages sent at or after this time. ISO date-time, e.g. 2026-10-23T08:00:00-10:00", required = false) String since,
+                                      @ToolParam(description = "true = full detail per message (IDs, user IDs, usernames). Default false = compact.", required = false) String verbose) {
         if (userId == null || userId.isEmpty()) {
             throw new IllegalArgumentException("userId cannot be null");
         }
@@ -269,7 +273,16 @@ public class UserService {
         }
         var privateChannel = user.openPrivateChannel().complete();
         List<Message> messages;
-        if (isProvided(before)) {
+        if (isProvided(since)) {
+            java.time.Instant sinceTime;
+            try {
+                sinceTime = java.time.OffsetDateTime.parse(since.trim()).toInstant();
+            } catch (java.time.format.DateTimeParseException ex) {
+                throw new IllegalArgumentException("since must be an ISO date-time like 2026-10-23T08:00:00-10:00");
+            }
+            String cursor = Long.toUnsignedString(net.dv8tion.jda.api.utils.TimeUtil.getDiscordTimestamp(sinceTime.toEpochMilli()));
+            messages = privateChannel.getHistoryAfter(cursor, limit).complete().getRetrievedHistory();
+        } else if (isProvided(before)) {
             messages = privateChannel.getHistoryBefore(before, limit).complete().getRetrievedHistory();
         } else if (isProvided(after)) {
             messages = privateChannel.getHistoryAfter(after, limit).complete().getRetrievedHistory();
@@ -278,13 +291,16 @@ public class UserService {
         } else {
             messages = privateChannel.getHistory().retrievePast(limit).complete();
         }
+        if (!"true".equalsIgnoreCase(verbose)) {
+            return compact.page(messages);
+        }
         List<String> formatedMessages = formatMessages(messages);
         return "**Retrieved " + messages.size() + " messages:** \n" + String.join("\n", formatedMessages);
     }
 
     private int parseMessageLimit(String count) {
         if (count == null || count.isBlank()) {
-            return 25;
+            return 10;
         }
 
         int limit;
