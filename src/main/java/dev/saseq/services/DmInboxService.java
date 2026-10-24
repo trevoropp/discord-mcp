@@ -2,10 +2,15 @@ package dev.saseq.services;
 
 import net.dv8tion.jda.api.JDA;
 import net.dv8tion.jda.api.entities.Guild;
+import net.dv8tion.jda.api.entities.Member;
 import net.dv8tion.jda.api.entities.Message;
+import net.dv8tion.jda.api.entities.MessageHistory;
+import net.dv8tion.jda.api.entities.Role;
 import net.dv8tion.jda.api.entities.User;
 import net.dv8tion.jda.api.entities.channel.ChannelType;
 import net.dv8tion.jda.api.entities.channel.concrete.PrivateChannel;
+import net.dv8tion.jda.api.entities.channel.middleman.MessageChannel;
+import net.dv8tion.jda.api.requests.RestAction;
 import net.dv8tion.jda.api.events.message.MessageReceivedEvent;
 import net.dv8tion.jda.api.events.message.MessageUpdateEvent;
 import net.dv8tion.jda.api.hooks.ListenerAdapter;
@@ -87,7 +92,10 @@ public class DmInboxService extends ListenerAdapter implements DisposableBean {
     private static final Duration WEBHOOK_RETRY_DELAY = Duration.ofSeconds(5);
 
     private final JDA jda;
+    private final CompactFormatter compact;
     private final Deque<InboxEntry> inbox = new ArrayDeque<>();
+    /** How many earlier messages of the conversation ride along in each webhook push. */
+    private static final int CONTEXT_MESSAGES = 6;
     private final HttpClient httpClient = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(10))
             .build();
@@ -113,6 +121,7 @@ public class DmInboxService extends ListenerAdapter implements DisposableBean {
     });
 
     public DmInboxService(JDA jda,
+                          CompactFormatter compact,
                           Environment env,
                           @Value("${WEBHOOK_SECRET_HEADER:X-Webhook-Secret}") String webhookSecretHeader,
                           @Value("${WEBHOOK_CHANNEL_IDS:}") String webhookChannelIds,
@@ -121,6 +130,7 @@ public class DmInboxService extends ListenerAdapter implements DisposableBean {
                           @Value("${WEBHOOK_COALESCE_SECONDS:45}") String coalesceSeconds,
                           @Value("${INBOX_FILE:}") String inboxFilePath) {
         this.jda = jda;
+        this.compact = compact;
         this.inboxFile = (inboxFilePath == null || inboxFilePath.isBlank()) ? null : Path.of(inboxFilePath.trim());
         loadInbox();
         long coalesce;
@@ -348,7 +358,7 @@ public class DmInboxService extends ListenerAdapter implements DisposableBean {
     /**
      * Lists DMs the bot has received. By default returns only unread ones and marks them read.
      */
-    @Tool(name = "check_dm_inbox", description = "List direct messages sent to the bot. Returns unread DMs by default and marks them as read, so each call shows what is new since the last check. Use this to find out who has messaged the bot, then reply with send_private_message using the sender's user ID. The inbox is saved to disk and survives bot restarts and redeploys; it keeps the most recent " + MAX_INBOX_SIZE + " DMs (roughly two weeks), oldest dropped first.")
+    @Tool(name = "check_dm_inbox", description = "List direct messages sent to the bot. Returns unread DMs by default and marks them as read, so each call shows what is new since the last check. Use this to find out who has messaged the bot, then reply with send_private_message using the sender's user ID. Output is compact: one line per DM with local time, name, user ID, [unread] flag and text. The inbox is saved to disk and survives bot restarts and redeploys; it keeps the most recent " + MAX_INBOX_SIZE + " DMs (roughly two weeks), oldest dropped first.")
     public String checkDmInbox(@ToolParam(description = "true (default) = only DMs not yet returned by a previous call; false = every DM kept in the inbox", required = false) String unreadOnly,
                                @ToolParam(description = "true (default) = mark the returned DMs as read; false = leave them unread so the next call returns them again", required = false) String markAsRead,
                                @ToolParam(description = "Only return DMs from this user ID", required = false) String fromUserId) {
@@ -406,14 +416,12 @@ public class DmInboxService extends ListenerAdapter implements DisposableBean {
 
     private String format(InboxEntry e) {
         StringBuilder sb = new StringBuilder();
-        sb.append(String.format("- (ID: %s) **[%s | user ID: %s | display name: %s]** `%s`%s: ```%s```",
-                e.messageId(), e.username(), e.userId(), e.displayName(), e.receivedAt(),
-                e.unread() ? " (unread)" : "", e.content()));
-        if (!e.attachmentUrls().isEmpty()) {
-            sb.append("\n  Attachments:");
-            for (String url : e.attachmentUrls()) {
-                sb.append("\n    - ").append(url);
-            }
+        sb.append("- ").append(compact.time(e.receivedAt())).append("  ")
+          .append(e.displayName()).append(" (user ").append(e.userId()).append(")")
+          .append(e.unread() ? " [unread]" : "").append(": ")
+          .append(e.content().replace("\n", "\n    "));
+        for (String url : e.attachmentUrls()) {
+            sb.append(" [📎 ").append(url).append("]");
         }
         return sb.toString();
     }
@@ -537,11 +545,88 @@ public class DmInboxService extends ListenerAdapter implements DisposableBean {
      */
     private void forwardToWebhook(Batch batch, List<InboxEntry> entries, boolean sync) {
         InboxEntry first = entries.get(0);
+        String label = batch.type + " " + first.messageId() + (entries.size() > 1 ? " (+" + (entries.size() - 1) + ")" : "")
+                + " -> " + batch.route.guildName();
+        if (sync) {
+            // Shutdown flush: no time for a context fetch, send what we have.
+            HttpRequest request = buildRequest(batch, entries, "[]", false);
+            try {
+                HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+                if (response.statusCode() >= 300) {
+                    System.err.println("Message webhook returned HTTP " + response.statusCode() + " for " + label + " during shutdown flush");
+                }
+            } catch (Exception ex) {
+                System.err.println("Message webhook delivery failed for " + label + " during shutdown flush: " + ex.getMessage());
+            }
+            return;
+        }
+        // Fetch the last few messages of the conversation (before this batch) so the agent can
+        // usually reply without a read_private_messages / read_messages round trip.
+        RestAction<MessageHistory> history;
+        if (batch.channelId == null) {
+            history = jda.openPrivateChannelById(first.userId())
+                    .flatMap(pc -> pc.getHistoryBefore(first.messageId(), CONTEXT_MESSAGES));
+        } else {
+            MessageChannel channel = jda.getChannelById(MessageChannel.class, batch.channelId);
+            history = channel == null ? null : channel.getHistoryBefore(first.messageId(), CONTEXT_MESSAGES);
+        }
+        if (history == null) {
+            sendWebhook(buildRequest(batch, entries, "[]", false), buildRequest(batch, entries, "[]", true), label, 1);
+            return;
+        }
+        history.queue(
+                h -> {
+                    String ctx = recentMessagesJson(h.getRetrievedHistory());
+                    sendWebhook(buildRequest(batch, entries, ctx, false), buildRequest(batch, entries, ctx, true), label, 1);
+                },
+                err -> {
+                    System.err.println("Message webhook: could not fetch context for " + label + ": " + err.getMessage() + "; sending without it");
+                    sendWebhook(buildRequest(batch, entries, "[]", false), buildRequest(batch, entries, "[]", true), label, 1);
+                });
+    }
+
+    /** Oldest first: {@code [{"from","fromUserId","isBot","at","atIso","text","attachments":[names]}]}. */
+    private String recentMessagesJson(List<Message> messages) {
+        return messages.stream()
+                .sorted((a, b) -> a.getTimeCreated().compareTo(b.getTimeCreated()))
+                .map(m -> "{"
+                        + "\"from\":\"" + escape(compact.bestName(m.getAuthor(), m.isFromGuild() ? m.getGuild() : null)) + "\","
+                        + "\"fromUserId\":\"" + escape(m.getAuthor().getId()) + "\","
+                        + "\"isBot\":" + m.getAuthor().isBot() + ","
+                        + "\"at\":\"" + escape(compact.time(m.getTimeCreated())) + "\","
+                        + "\"atIso\":\"" + escape(m.getTimeCreated().toString()) + "\","
+                        + "\"text\":\"" + escape(m.getContentDisplay()) + "\","
+                        + "\"attachments\":[" + m.getAttachments().stream()
+                                .map(a -> "\"" + escape(a.getFileName()) + "\"").collect(Collectors.joining(",")) + "]"
+                        + "}")
+                .collect(Collectors.joining(",", "[", "]"));
+    }
+
+    /**
+     * Builds one webhook request. The payload keeps the single-message fields (messageId and
+     * receivedAt are the first message's, content is all messages joined by newlines) and adds
+     * messageIds, messageCount, sender details for the routed server, recentMessages, and isRetry.
+     */
+    private HttpRequest buildRequest(Batch batch, List<InboxEntry> entries, String recentMessagesJson, boolean isRetry) {
+        InboxEntry first = entries.get(0);
         String content = entries.stream().map(InboxEntry::content).collect(Collectors.joining("\n"));
         List<String> attachments = entries.stream().flatMap(x -> x.attachmentUrls().stream()).toList();
         boolean dm = batch.channelId == null;
+
+        // Who the sender is in the routed server: nickname and roles, so the agent needs no roster lookup.
+        String nickname = null;
+        List<String> roles = List.of();
+        Guild routed = jda.getGuildById(batch.guildId);
+        Member member = routed == null ? null : routed.getMemberById(first.userId());
+        if (member != null) {
+            nickname = member.getNickname();
+            roles = member.getRoles().stream().map(Role::getName).toList();
+        }
+        String senderName = nickname != null && !nickname.isBlank() ? nickname : first.displayName();
+
         String json = "{"
                 + "\"type\":\"" + batch.type + "\","
+                + "\"isRetry\":" + isRetry + ","
                 // guildId stays null for DMs (they have no server); routedGuildId says whose agent received it
                 + "\"guildId\":" + jsonOrNull(dm ? null : batch.guildId) + ","
                 + "\"routedGuildId\":\"" + escape(batch.guildId) + "\","
@@ -557,10 +642,17 @@ public class DmInboxService extends ListenerAdapter implements DisposableBean {
                 + "\"userId\":\"" + escape(first.userId()) + "\","
                 + "\"username\":\"" + escape(first.username()) + "\","
                 + "\"displayName\":\"" + escape(first.displayName()) + "\","
+                + "\"sender\":{"
+                        + "\"name\":\"" + escape(senderName) + "\","
+                        + "\"nickname\":" + jsonOrNull(nickname) + ","
+                        + "\"roles\":[" + roles.stream().map(r -> "\"" + escape(r) + "\"").collect(Collectors.joining(",")) + "]"
+                        + "},"
                 + "\"receivedAt\":\"" + escape(first.receivedAt().toString()) + "\","
+                + "\"receivedAtLocal\":\"" + escape(compact.time(first.receivedAt())) + "\","
                 + "\"content\":\"" + escape(content) + "\","
                 + "\"attachments\":[" + attachments.stream()
-                        .map(u -> "\"" + escape(u) + "\"").collect(Collectors.joining(",")) + "]"
+                        .map(u -> "\"" + escape(u) + "\"").collect(Collectors.joining(",")) + "],"
+                + "\"recentMessages\":" + recentMessagesJson
                 + "}";
         HttpRequest.Builder request = HttpRequest.newBuilder(URI.create(batch.route.url()))
                 .timeout(Duration.ofSeconds(15))
@@ -569,20 +661,7 @@ public class DmInboxService extends ListenerAdapter implements DisposableBean {
         if (!batch.route.secret().isEmpty()) {
             request.header(webhookSecretHeader, batch.route.secret());
         }
-        String label = batch.type + " " + first.messageId() + (entries.size() > 1 ? " (+" + (entries.size() - 1) + ")" : "")
-                + " -> " + batch.route.guildName();
-        if (sync) {
-            try {
-                HttpResponse<String> response = httpClient.send(request.build(), HttpResponse.BodyHandlers.ofString());
-                if (response.statusCode() >= 300) {
-                    System.err.println("Message webhook returned HTTP " + response.statusCode() + " for " + label + " during shutdown flush");
-                }
-            } catch (Exception ex) {
-                System.err.println("Message webhook delivery failed for " + label + " during shutdown flush: " + ex.getMessage());
-            }
-            return;
-        }
-        sendWebhook(request.build(), label, 1);
+        return request.build();
     }
 
     /**
@@ -590,7 +669,7 @@ public class DmInboxService extends ListenerAdapter implements DisposableBean {
      * {@link #WEBHOOK_RETRY_DELAY}; a 4xx means the receiver rejected the payload, so it is
      * logged with the response body and not retried.
      */
-    private void sendWebhook(HttpRequest request, String label, int attempt) {
+    private void sendWebhook(HttpRequest request, HttpRequest retryRequest, String label, int attempt) {
         httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
                 .thenAccept(response -> {
                     int status = response.statusCode();
@@ -600,7 +679,7 @@ public class DmInboxService extends ListenerAdapter implements DisposableBean {
                     if (status >= 500 && attempt == 1) {
                         System.err.println("Message webhook returned HTTP " + status + " for " + label
                                 + "; retrying once");
-                        retryWebhook(request, label);
+                        retryWebhook(retryRequest, label);
                         return;
                     }
                     String body = response.body() == null ? "" : response.body().strip();
@@ -615,7 +694,7 @@ public class DmInboxService extends ListenerAdapter implements DisposableBean {
                     if (attempt == 1) {
                         System.err.println("Message webhook delivery failed for " + label + ": "
                                 + ex.getMessage() + "; retrying once");
-                        retryWebhook(request, label);
+                        retryWebhook(retryRequest, label);
                     } else {
                         System.err.println("Message webhook delivery failed for " + label
                                 + " after retry: " + ex.getMessage());
@@ -624,9 +703,10 @@ public class DmInboxService extends ListenerAdapter implements DisposableBean {
                 });
     }
 
-    private void retryWebhook(HttpRequest request, String label) {
+    /** The retry carries isRetry:true so a receiver that already handled the first attempt can skip it. */
+    private void retryWebhook(HttpRequest retryRequest, String label) {
         CompletableFuture.delayedExecutor(WEBHOOK_RETRY_DELAY.toMillis(), TimeUnit.MILLISECONDS)
-                .execute(() -> sendWebhook(request, label, 2));
+                .execute(() -> sendWebhook(retryRequest, retryRequest, label, 2));
     }
 
     // ---- persistence (one entry per line, fields tab-separated, free text base64-encoded) ----
