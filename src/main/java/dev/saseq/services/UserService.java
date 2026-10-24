@@ -20,13 +20,15 @@ public class UserService {
 
     private final JDA jda;
     private final CompactFormatter compact;
+    private final DmInboxService dmInbox;
 
     @Value("${DISCORD_GUILD_ID:}")
     private String defaultGuildId;
 
-    public UserService(JDA jda, CompactFormatter compact) {
+    public UserService(JDA jda, CompactFormatter compact, DmInboxService dmInbox) {
         this.jda = jda;
         this.compact = compact;
+        this.dmInbox = dmInbox;
     }
 
     private String resolveGuildId(String guildId) {
@@ -177,6 +179,8 @@ public class UserService {
             throw new IllegalArgumentException("User not found by userId");
         }
         Message sentMessage = user.openPrivateChannel().complete().sendMessage(message).complete();
+        // Replying to someone means their pending DMs have been handled.
+        dmInbox.markReadFromUser(userId);
         return "Message sent successfully. Message link: " + sentMessage.getJumpUrl();
     }
 
