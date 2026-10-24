@@ -16,11 +16,13 @@ import dev.saseq.services.InviteService;
 import dev.saseq.services.ChannelPermissionService;
 import dev.saseq.services.EmojiService;
 import dev.saseq.services.ForumService;
+import dev.saseq.services.ToolUsageStats;
 import net.dv8tion.jda.api.JDA;
 import net.dv8tion.jda.api.JDABuilder;
 import net.dv8tion.jda.api.requests.GatewayIntent;
 import net.dv8tion.jda.api.utils.ChunkingFilter;
 import net.dv8tion.jda.api.utils.MemberCachePolicy;
+import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.tool.ToolCallbackProvider;
 import org.springframework.ai.tool.method.MethodToolCallbackProvider;
 import org.springframework.beans.factory.annotation.Value;
@@ -45,8 +47,9 @@ public class DiscordMcpConfig {
                                              ChannelPermissionService channelPermissionService,
                                              EmojiService emojiService,
                                              ForumService forumService,
-                                             DmInboxService dmInboxService) {
-        return MethodToolCallbackProvider.builder().toolObjects(
+                                             DmInboxService dmInboxService,
+                                             ToolUsageStats toolUsageStats) {
+        ToolCallbackProvider provider = MethodToolCallbackProvider.builder().toolObjects(
                 discordService,
                 messageService,
                 dmInboxService,
@@ -62,8 +65,19 @@ public class DiscordMcpConfig {
                 inviteService,
                 channelPermissionService,
                 emojiService,
-                forumService
+                forumService,
+                toolUsageStats
         ).build();
+        // Measure every tool call (count, bytes returned, duration) so agents can see their real context cost.
+        ToolCallback[] wrapped = java.util.Arrays.stream(provider.getToolCallbacks())
+                .map(toolUsageStats::wrap)
+                .toArray(ToolCallback[]::new);
+        return new ToolCallbackProvider() {
+            @Override
+            public ToolCallback[] getToolCallbacks() {
+                return wrapped;
+            }
+        };
     }
 
     @Bean
