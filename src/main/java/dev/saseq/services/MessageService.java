@@ -12,6 +12,7 @@ import net.dv8tion.jda.api.entities.channel.concrete.TextChannel;
 import net.dv8tion.jda.api.entities.channel.concrete.ThreadChannel;
 import net.dv8tion.jda.api.entities.channel.middleman.MessageChannel;
 import net.dv8tion.jda.api.entities.emoji.Emoji;
+import net.dv8tion.jda.api.utils.FileUpload;
 import net.dv8tion.jda.api.utils.TimeUtil;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
@@ -31,10 +32,12 @@ public class MessageService {
 
     private final JDA jda;
     private final CompactFormatter compact;
+    private final AttachmentFetcher attachments;
 
-    public MessageService(JDA jda, CompactFormatter compact) {
+    public MessageService(JDA jda, CompactFormatter compact, AttachmentFetcher attachments) {
         this.jda = jda;
         this.compact = compact;
+        this.attachments = attachments;
     }
 
     /**
@@ -66,22 +69,32 @@ public class MessageService {
      * @param message   The content of the message to be sent.
      * @return A confirmation message with a link to the sent message.
      */
-    @Tool(name = "send_message", description = "Send a message to a specific channel")
+    @Tool(name = "send_message", description = "Send a message to a specific channel, optionally with file attachments. Give attachmentUrls as comma-separated http(s) URLs (Discord CDN links, Google Drive share links, any public file); the bot downloads each and attaches it, so images preview inline. Up to 10 files, 8 MB each. A file that only exists in your workspace must be uploaded somewhere with a URL first.")
     public String sendMessage(@ToolParam(description = "Discord channel ID") String channelId,
-                              @ToolParam(description = "Message content") String message) {
+                              @ToolParam(description = "Message content (may be empty when attachments are given)", required = false) String message,
+                              @ToolParam(description = "Comma-separated URLs of files to attach", required = false) String attachmentUrls) {
         if (channelId == null || channelId.isEmpty()) {
             throw new IllegalArgumentException("channelId cannot be null");
         }
-        if (message == null || message.isEmpty()) {
-            throw new IllegalArgumentException("message cannot be null");
+        List<FileUpload> files = attachments.fetch(attachmentUrls);
+        if ((message == null || message.isBlank()) && files.isEmpty()) {
+            throw new IllegalArgumentException("message cannot be empty unless attachmentUrls is given");
         }
 
         MessageChannel channel = getMessageChannelById(channelId);
         if (channel == null) {
             throw new IllegalArgumentException("Channel not found by channelId");
         }
-        Message sentMessage = channel.sendMessage(message).complete();
-        return "Message sent successfully. Message link: " + sentMessage.getJumpUrl();
+        Message sentMessage;
+        if (files.isEmpty()) {
+            sentMessage = channel.sendMessage(message).complete();
+        } else if (message == null || message.isBlank()) {
+            sentMessage = channel.sendFiles(files).complete();
+        } else {
+            sentMessage = channel.sendMessage(message).addFiles(files).complete();
+        }
+        return "Message sent successfully" + (files.isEmpty() ? "" : " with " + files.size() + " attachment(s)")
+                + ". Message link: " + sentMessage.getJumpUrl();
     }
 
     /**
