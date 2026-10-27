@@ -75,6 +75,12 @@ public class AttachmentFetcher {
             throw new IllegalArgumentException("Could not download " + url + ": HTTP " + response.statusCode());
         }
         byte[] data = response.body();
+        String contentType = response.headers().firstValue("content-type").orElse("").toLowerCase();
+        String path = uri.getPath() == null ? "" : uri.getPath().toLowerCase();
+        if (contentType.startsWith("text/html") && !path.endsWith(".html") && !path.endsWith(".htm")) {
+            // A share link that needs sign-in, a Google Doc (not a file), or an error page: not something to attach.
+            throw new IllegalArgumentException("URL returned a web page, not a file (is it shared publicly, and is it an uploaded file rather than a Google Doc?): " + url);
+        }
         if (data.length == 0) {
             throw new IllegalArgumentException("Downloaded file is empty: " + url);
         }
