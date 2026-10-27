@@ -7,6 +7,7 @@ import net.dv8tion.jda.api.entities.Message;
 import net.dv8tion.jda.api.entities.User;
 import net.dv8tion.jda.api.exceptions.ErrorResponseException;
 import net.dv8tion.jda.api.requests.ErrorResponse;
+import net.dv8tion.jda.api.utils.FileUpload;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.beans.factory.annotation.Value;
@@ -21,14 +22,16 @@ public class UserService {
     private final JDA jda;
     private final CompactFormatter compact;
     private final DmInboxService dmInbox;
+    private final AttachmentFetcher attachments;
 
     @Value("${DISCORD_GUILD_ID:}")
     private String defaultGuildId;
 
-    public UserService(JDA jda, CompactFormatter compact, DmInboxService dmInbox) {
+    public UserService(JDA jda, CompactFormatter compact, DmInboxService dmInbox, AttachmentFetcher attachments) {
         this.jda = jda;
         this.compact = compact;
         this.dmInbox = dmInbox;
+        this.attachments = attachments;
     }
 
     private String resolveGuildId(String guildId) {
@@ -164,21 +167,31 @@ public class UserService {
      * @param message The content of the private message.
      * @return A confirmation message with a link to the sent message.
      */
-    @Tool(name = "send_private_message", description = "Send a private message to a specific user")
+    @Tool(name = "send_private_message", description = "Send a private message to a specific user, optionally with file attachments. Give attachmentUrls as comma-separated http(s) URLs (Discord CDN links, Google Drive share links, any public file); the bot downloads each and attaches it, so images preview inline. Up to 10 files, 8 MB each. A file that only exists in your workspace must be uploaded somewhere with a URL first.")
     public String sendPrivateMessage(@ToolParam(description = "Discord user ID") String userId,
-                                     @ToolParam(description = "Message content") String message) {
+                                     @ToolParam(description = "Message content (may be empty when attachments are given)", required = false) String message,
+                                     @ToolParam(description = "Comma-separated URLs of files to attach", required = false) String attachmentUrls) {
         if (userId == null || userId.isEmpty()) {
             throw new IllegalArgumentException("userId cannot be null");
         }
-        if (message == null || message.isEmpty()) {
-            throw new IllegalArgumentException("message cannot be null");
+        List<FileUpload> files = attachments.fetch(attachmentUrls);
+        if ((message == null || message.isBlank()) && files.isEmpty()) {
+            throw new IllegalArgumentException("message cannot be empty unless attachmentUrls is given");
         }
 
         User user = getUserById(userId);
         if (user == null) {
             throw new IllegalArgumentException("User not found by userId");
         }
-        Message sentMessage = user.openPrivateChannel().complete().sendMessage(message).complete();
+        var channel = user.openPrivateChannel().complete();
+        Message sentMessage;
+        if (files.isEmpty()) {
+            sentMessage = channel.sendMessage(message).complete();
+        } else if (message == null || message.isBlank()) {
+            sentMessage = channel.sendFiles(files).complete();
+        } else {
+            sentMessage = channel.sendMessage(message).addFiles(files).complete();
+        }
         // Replying to someone means their pending DMs have been handled.
         dmInbox.markReadFromUser(userId);
         return "Message sent successfully. Message link: " + sentMessage.getJumpUrl();
